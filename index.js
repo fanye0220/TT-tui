@@ -20,6 +20,7 @@
         'miu_ping', 'miu_status', 'miu_push_begin',
         'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
         'miu_outbox_list', 'miu_outbox_fetch', 'miu_outbox_ack', 'miu_outbox_clear',
+        'miu_pull_state', 'miu_pull_list', 'miu_pull_report',
     ];
 
     const ERRORS = {
@@ -43,6 +44,10 @@
         connected: false,
         busy: false,
         callMode: null,
+        /** 正在处理 MIU 的拉取请求，避免轮询重复触发。 */
+        pullBusy: false,
+        /** 最近一次拿到的酒馆角色列表，用来给拉取的卡补名字。 */
+        catalog: [],
     };
 
     let settingsModule = null;
@@ -145,7 +150,8 @@
           <li>点「推送当前角色」或「推送全部角色卡」，等进度跑完。</li>
           <li>切回 MIU → 设置 → TT 互联 → 点「选择要导入的卡」，勾选后导入。</li>
         </ol>
-        <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点「发送到酒馆（TT 联动）」，卡会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」，勾选后导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 6 秒自动刷新）。</p>
+        <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点纸飞机「发送到酒馆」，在弹出的选项里选「发送到酒馆（TT 联动）」，卡就会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 3 秒自动刷新）。</p>
+        <p><b>MIU 主动拉取（酒馆 → MIU）</b>：在 MIU 里点「从酒馆拉取」，勾选想拉进来的卡，这边会自动把卡送过去，本页不用点任何按钮。拉的时候 TT 保持运行（挂小窗最稳）。</p>
         <p>连不上时：先确认 MIU 的接收服务开着；再确认 MIU 没有被系统冻结（可以分屏或锁定后台）。安卓切后台会冻结 App，所以推完请尽快切回 MIU 导入。</p>
       </details>
       <div class="miu-bridge-log" id="miu_bridge_log"></div>
@@ -512,6 +518,83 @@
     const RECEIVE_LABEL = '接收 MIU 推送';
     let outboxTimer = null;
 
+    // ------------------------------------------------------------------
+    // MIU 主动拉取（MIU 里挑酒馆的卡）
+    // ------------------------------------------------------------------
+
+    /** MIU 要角色列表：把酒馆的卡列表送过去，让它显示出来给用户勾选。 */
+    async function sendCatalogToMiu() {
+        const list = await listCharacters();
+        state.catalog = list;
+        await callTool('miu_pull_list', { json: JSON.stringify(list) });
+        setStatus('已把酒馆里的 ' + list.length + ' 张角色卡发给 MIU，去 MIU 里勾选要拉哪几张。', 'ok');
+        log('已把 ' + list.length + ' 张角色卡发给 MIU。');
+    }
+
+    /** MIU 勾好之后：逐张导出 PNG 推进 MIU 的待接收队列，最后把新卡 id 回报过去。 */
+    async function pullForMiu(picks) {
+        const named = new Map((state.catalog || []).map(item => [item.avatar, item.name]));
+        const ids = [];
+        let done = 0;
+        let failed = 0;
+
+        for (let index = 0; index < picks.length; index++) {
+            const avatar = picks[index];
+            const name = cardFileName(named.get(avatar) || avatar);
+            try {
+                const result = await pushOne({ avatar, name }, '「' + name + '」');
+                if (result && typeof result.id === 'string' && result.id) ids.push(result.id);
+                done++;
+                log('已拉到 MIU：' + name);
+            } catch (error) {
+                failed++;
+                log('拉取失败：' + name + '（' + describe(error) + '）');
+            }
+
+            setStatus('正在给 MIU 拉卡… ' + (index + 1) + ' / ' + picks.length);
+            try {
+                await callTool('miu_pull_report', { done, failed, total: picks.length, final: false });
+            } catch (error) { /* 进度报不上去不影响继续拉 */ }
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
+        try {
+            await callTool('miu_pull_report', {
+                done,
+                failed,
+                total: picks.length,
+                final: true,
+                ids,
+                message: failed > 0
+                    ? ('拉了 ' + done + ' 张，失败 ' + failed + ' 张。')
+                    : ('已把 ' + done + ' 张卡拉到 MIU。'),
+            });
+        } catch (error) {
+            log('回报拉取结果失败：' + describe(error));
+        }
+
+        if (failed > 0) {
+            setStatus('拉取结束：成功 ' + done + ' 张，失败 ' + failed + ' 张（失败的那几张 MIU 里没有）。', 'error');
+        } else {
+            setStatus('拉取结束：' + done + ' 张已送进 MIU，切回 MIU 会自动入库。', 'ok');
+        }
+    }
+
+    /** 轮询里顺手处理 MIU 的拉取请求；有活干就返回 true。 */
+    async function handlePullRequests() {
+        const task = await callTool('miu_pull_state', {});
+        if (task && task.listWanted) {
+            await sendCatalogToMiu();
+            return true;
+        }
+        const picks = (task && Array.isArray(task.picks)) ? task.picks : [];
+        if (picks.length > 0) {
+            await pullForMiu(picks);
+            return true;
+        }
+        return false;
+    }
+
     function updateReceiveLabel(count) {
         const button = document.getElementById('miu_bridge_receive');
         if (!button) return;
@@ -521,12 +604,21 @@
     function startOutboxPolling() {
         if (outboxTimer) return;
         outboxTimer = setInterval(async function () {
-            if (!state.connected || !state.registrationId || state.busy) return;
+            if (!state.connected || !state.registrationId || state.busy || state.pullBusy) return;
             try {
                 const list = await callTool('miu_outbox_list', {});
                 updateReceiveLabel(Number(list.count) || 0);
             } catch (error) { /* 轮询失败不打扰用户 */ }
-        }, 6000);
+
+            state.pullBusy = true;
+            try {
+                await handlePullRequests();
+            } catch (error) {
+                log('处理 MIU 的拉取请求失败：' + describe(error));
+            } finally {
+                state.pullBusy = false;
+            }
+        }, 3000);
     }
 
     // ------------------------------------------------------------------
