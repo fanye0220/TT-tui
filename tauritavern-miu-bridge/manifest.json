@@ -1,0 +1,12 @@
+{
+  "display_name": "MIU 推卡桥接 (MIU Card Bridge)",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "MIU",
+  "version": "1.0.0",
+  "homePage": "https://github.com/",
+  "description": "把酒馆里的角色卡通过手机本机回环端口（127.0.0.1）直接推送到 MIU，不登录、不上云。"
+}
