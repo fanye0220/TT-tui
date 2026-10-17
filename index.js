@@ -19,6 +19,7 @@
     const TOOL_NAMES = [
         'miu_ping', 'miu_status', 'miu_push_begin',
         'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
+        'miu_outbox_list', 'miu_outbox_fetch', 'miu_outbox_ack', 'miu_outbox_clear',
     ];
 
     const ERRORS = {
@@ -32,6 +33,8 @@
         bridge_bad_response: 'MIU 的响应无法识别，可能两端版本不一致。',
         catalog_failed: '读取 TT 的角色列表失败。',
         select_character: '请先在 TT 里选中一张角色卡。',
+        import_failed: '酒馆拒绝了这次导入（这张卡可能已经存在，或格式不对）。',
+        unknown_card: '这张卡在 MIU 里已经不在待发送列表了。',
     };
 
     const state = {
@@ -132,6 +135,7 @@
         <div class="menu_button" id="miu_bridge_push_current">推送当前角色</div>
         <div class="menu_button" id="miu_bridge_push_all">推送全部角色卡</div>
         <div class="menu_button" id="miu_bridge_pending">查看待接收</div>
+        <div class="menu_button" id="miu_bridge_receive">接收 MIU 推送</div>
       </div>
       <details class="miu-bridge-help">
         <summary>怎么用 / 连不上怎么办</summary>
@@ -139,8 +143,9 @@
           <li>打开 MIU（安卓）→ 设置 → TT 互联 → 点「开启接收服务」，看到端口号就算好了。</li>
           <li>回到 TT 这一页，点「连接 MIU」。连上会显示 MIU 的端口和待接收数量。</li>
           <li>点「推送当前角色」或「推送全部角色卡」，等进度跑完。</li>
-          <li>切回 MIU → 设置 → TT 互联 → 点「导入待接收卡片」，确认入库。</li>
+          <li>切回 MIU → 设置 → TT 互联 → 点「选择要导入的卡」，勾选后导入。</li>
         </ol>
+        <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点「发送到酒馆（TT 联动）」，卡会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」，勾选后导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 6 秒自动刷新）。</p>
         <p>连不上时：先确认 MIU 的接收服务开着；再确认 MIU 没有被系统冻结（可以分屏或锁定后台）。安卓切后台会冻结 App，所以推完请尽快切回 MIU 导入。</p>
       </details>
       <div class="miu-bridge-log" id="miu_bridge_log"></div>
@@ -330,6 +335,21 @@
         return btoa(binary);
     }
 
+    function base64ToBytes(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) {
+            bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+    }
+
+    /** 角色卡文件名：统一带上合法后缀，避免酒馆拒收。 */
+    function cardFileName(name) {
+        const value = String(name || 'miu_card').replace(/[\\/]/g, '_').trim() || 'miu_card';
+        return /\.(png|jpe?g|webp|json)$/i.test(value) ? value : value + '.png';
+    }
+
     async function exportCard(avatar) {
         const headers = await requestHeaders();
         const response = await fetch('/api/characters/export', {
@@ -396,6 +416,120 @@
     }
 
     // ------------------------------------------------------------------
+    // 接收 MIU 推送（MIU -> 酒馆）
+    // ------------------------------------------------------------------
+
+    /** 把一张卡的字节导入酒馆。 */
+    async function importCardToTavern(name, bytes) {
+        const headers = await requestHeaders();
+        delete headers['Content-Type'];
+        delete headers['content-type'];
+
+        const isJson = /\.json$/i.test(name);
+        const form = new FormData();
+        form.append('avatar', new Blob([bytes], { type: isJson ? 'application/json' : 'image/png' }), name);
+        form.append('file_type', isJson ? 'json' : 'png');
+
+        const response = await fetch('/api/characters/import', {
+            method: 'POST',
+            headers,
+            body: form,
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('import_failed');
+        return true;
+    }
+
+    /** 分片取回 MIU 里的一张待发送卡。 */
+    async function fetchOutboxCard(meta, label) {
+        const total = Math.max(1, Math.ceil(Number(meta.bytes) / CHUNK_BYTES));
+        const parts = [];
+        for (let index = 0; index < total; index++) {
+            const chunk = await callTool('miu_outbox_fetch', { id: meta.id, index });
+            if (!chunk || typeof chunk.data !== 'string') throw new Error('bridge_bad_response');
+            parts.push(base64ToBytes(chunk.data));
+            if (total > 1) setStatus('正在接收 ' + label + '：' + (index + 1) + ' / ' + total + ' 片');
+        }
+
+        const bytes = new Uint8Array(Number(meta.bytes) || 0);
+        let offset = 0;
+        for (const part of parts) {
+            bytes.set(part, offset);
+            offset += part.length;
+        }
+        if (offset !== bytes.length) throw new Error('bridge_bad_response');
+        return bytes;
+    }
+
+    async function refreshTavernCharacters() {
+        try {
+            const module = await import('../../../../script.js');
+            if (typeof module.getCharacters === 'function') await module.getCharacters();
+        } catch (error) { /* 刷不出列表不影响导入本身 */ }
+    }
+
+    /** 把 MIU 里排队的卡全部导入酒馆；导入成功才 ack，失败的原样留在 MIU。 */
+    async function receiveFromMiu() {
+        await ensureConnected();
+        const list = await callTool('miu_outbox_list', {});
+        const cards = Array.isArray(list.cards) ? list.cards : [];
+        if (cards.length === 0) {
+            setStatus('MIU 里没有等待发送到酒馆的卡。', 'ok');
+            log('待发送列表是空的。');
+            return;
+        }
+
+        let done = 0;
+        let failed = 0;
+        for (let index = 0; index < cards.length; index++) {
+            const meta = cards[index];
+            const fileName = cardFileName(meta.name);
+            try {
+                const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
+                await importCardToTavern(fileName, bytes);
+                await callTool('miu_outbox_ack', { id: meta.id });
+                done++;
+                log('已导入酒馆：' + fileName + '（' + bytes.length + ' 字节）');
+            } catch (error) {
+                failed++;
+                log('导入失败：' + fileName + '（' + describe(error) + '）');
+            }
+            updateReceiveLabel(Math.max(0, cards.length - index - 1));
+            setStatus('接收中… 已导入 ' + done + ' / ' + cards.length + ' 张');
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
+        await refreshTavernCharacters();
+        await refreshStatus();
+        if (failed > 0) {
+            setStatus('接收结束：成功 ' + done + ' 张，失败 ' + failed + ' 张（失败的那些还留在 MIU 队列里）。', 'error');
+        } else {
+            setStatus('接收结束：' + done + ' 张已导入酒馆。', 'ok');
+        }
+        log('本轮接收完成。');
+    }
+
+    const RECEIVE_LABEL = '接收 MIU 推送';
+    let outboxTimer = null;
+
+    function updateReceiveLabel(count) {
+        const button = document.getElementById('miu_bridge_receive');
+        if (!button) return;
+        button.textContent = count > 0 ? (RECEIVE_LABEL + ' (' + count + ')') : RECEIVE_LABEL;
+    }
+
+    function startOutboxPolling() {
+        if (outboxTimer) return;
+        outboxTimer = setInterval(async function () {
+            if (!state.connected || !state.registrationId || state.busy) return;
+            try {
+                const list = await callTool('miu_outbox_list', {});
+                updateReceiveLabel(Number(list.count) || 0);
+            } catch (error) { /* 轮询失败不打扰用户 */ }
+        }, 6000);
+    }
+
+    // ------------------------------------------------------------------
     // 按钮
     // ------------------------------------------------------------------
 
@@ -418,6 +552,7 @@
         const pushCurrentButton = document.getElementById('miu_bridge_push_current');
         const pushAllButton = document.getElementById('miu_bridge_push_all');
         const pendingButton = document.getElementById('miu_bridge_pending');
+        const receiveButton = document.getElementById('miu_bridge_receive');
 
         connectButton.addEventListener('click', function () {
             withBusy(async function () {
@@ -490,6 +625,12 @@
                 log('MIU 待接收 ' + info.pending + ' 张：' + (names || '（空）'));
             });
         });
+
+        receiveButton.addEventListener('click', function () {
+            withBusy(async function () {
+                await receiveFromMiu();
+            });
+        });
     }
 
     function mount() {
@@ -500,6 +641,8 @@
         }
         container.insertAdjacentHTML('beforeend', buildHtml());
         bindUi();
+        updateReceiveLabel(0);
+        startOutboxPolling();
         console.log('[MIU 联动] 面板已挂载。');
         return true;
     }
