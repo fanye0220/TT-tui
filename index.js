@@ -1,0 +1,529 @@
+/**
+ * MIU 联动（MIU <-> TauriTavern）
+ * ------------------------------------------------------------------
+ * 把酒馆（TauriTavern）里的角色卡推进 MIU 安卓 App。
+ *
+ * 走 TT 自带的本机 MCP 客户端（Rust 侧直连 127.0.0.1），所以不受正式版
+ * TT「禁止明文 HTTP」的限制；不登录账号、不上云，数据只在你这台手机里走。
+ *
+ * 用法：先在 MIU 里「设置 -> TT 互联 -> 开启接收服务」，再回到这里点「连接 MIU」。
+ */
+(function () {
+    'use strict';
+
+    const DISPLAY_NAME = 'MIU 联动';
+    const MODULE_NAME = 'miuBridge';
+    const CANDIDATE_PORTS = [8791, 8792, 8793, 8794, 8795];
+    const CHUNK_BYTES = 48 * 1024;
+    const MAX_CARD_BYTES = 32 * 1024 * 1024;
+    const TOOL_NAMES = [
+        'miu_ping', 'miu_status', 'miu_push_begin',
+        'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
+    ];
+
+    const ERRORS = {
+        host_unavailable: '这个 TT 版本没有联动能力，需要官方 TauriTavern 2.3.0 或更高版本。',
+        no_receiver: '没找到 MIU 接收服务。请先打开 MIU -> 设置 -> TT 互联 -> 开启接收服务。',
+        not_connected: '还没连上 MIU，先点「连接 MIU」。',
+        export_failed: 'TT 导出这张角色卡失败（可能它不是 PNG 卡）。',
+        size_limit: '这张卡超过了单张 32 MB 的上限。',
+        bridge_unavailable: '联动通道暂时连不上 MIU（MIU 可能被系统冻结了，切回 MIU 一次再试）。',
+        bridge_rejected: 'MIU 没有接受这次请求，请确认 MIU 里的接收服务还开着。',
+        bridge_bad_response: 'MIU 的响应无法识别，可能两端版本不一致。',
+        catalog_failed: '读取 TT 的角色列表失败。',
+        select_character: '请先在 TT 里选中一张角色卡。',
+    };
+
+    const state = {
+        registrationId: null,
+        port: 0,
+        connected: false,
+        busy: false,
+        callMode: null,
+    };
+
+    let settingsModule = null;
+
+    // ------------------------------------------------------------------
+    // 宿主 / 设置
+    // ------------------------------------------------------------------
+
+    function host() {
+        const value = window.__TAURITAVERN__;
+        if (!value || !value.api || !value.api.mcp || !value.invoke || typeof value.invoke.safeInvoke !== 'function') {
+            throw new Error('host_unavailable');
+        }
+        return value;
+    }
+
+    async function hostReady() {
+        const pending = window.__TAURITAVERN__ && window.__TAURITAVERN__.ready
+            ? window.__TAURITAVERN__.ready
+            : window.__TAURITAVERN_MAIN_READY__;
+        if (pending && typeof pending.then === 'function') {
+            try { await pending; } catch (error) { /* 就绪失败后面会照常报错 */ }
+        }
+        return host();
+    }
+
+    async function extSettings() {
+        if (!settingsModule) {
+            settingsModule = await import('../../../extensions.js');
+        }
+        if (!settingsModule.extension_settings) {
+            settingsModule.extension_settings = {};
+        }
+        if (!settingsModule.extension_settings[MODULE_NAME]) {
+            settingsModule.extension_settings[MODULE_NAME] = {};
+        }
+        return settingsModule.extension_settings[MODULE_NAME];
+    }
+
+    async function saveSettings() {
+        try {
+            const module = await import('../../../../script.js');
+            if (typeof module.saveSettingsDebounced === 'function') module.saveSettingsDebounced();
+        } catch (error) { /* 存不下不影响本次使用 */ }
+    }
+
+    async function requestHeaders() {
+        const module = await import('../../../../script.js');
+        if (typeof module.getRequestHeaders !== 'function') throw new Error('host_unavailable');
+        return module.getRequestHeaders();
+    }
+
+    // ------------------------------------------------------------------
+    // 界面
+    // ------------------------------------------------------------------
+
+    function setStatus(text, kind) {
+        const element = document.getElementById('miu_bridge_status');
+        if (!element) return;
+        element.textContent = text;
+        element.classList.remove('miu-ok', 'miu-error');
+        if (kind === 'ok') element.classList.add('miu-ok');
+        if (kind === 'error') element.classList.add('miu-error');
+    }
+
+    function log(text) {
+        const box = document.getElementById('miu_bridge_log');
+        if (!box) return;
+        const line = '[' + new Date().toLocaleTimeString() + '] ' + text + '\n';
+        box.textContent = (line + box.textContent).slice(0, 8000);
+    }
+
+    function describe(error) {
+        const code = error && error.message ? error.message : String(error);
+        return ERRORS[code] || ('出错了：' + code);
+    }
+
+    function buildHtml() {
+        return `
+<div class="inline-drawer">
+  <div class="inline-drawer-toggle inline-drawer-header">
+    <b>MIU 联动</b>
+    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+  </div>
+  <div class="inline-drawer-content">
+    <div class="miu-bridge-block">
+      <div class="miu-bridge-status" id="miu_bridge_status">未连接</div>
+      <div class="miu-bridge-row">
+        <div class="menu_button" id="miu_bridge_connect">连接 MIU</div>
+        <div class="menu_button" id="miu_bridge_push_current">推送当前角色</div>
+        <div class="menu_button" id="miu_bridge_push_all">推送全部角色卡</div>
+        <div class="menu_button" id="miu_bridge_pending">查看待接收</div>
+      </div>
+      <details class="miu-bridge-help">
+        <summary>怎么用 / 连不上怎么办</summary>
+        <ol>
+          <li>打开 MIU（安卓）→ 设置 → TT 互联 → 点「开启接收服务」，看到端口号就算好了。</li>
+          <li>回到 TT 这一页，点「连接 MIU」。连上会显示 MIU 的端口和待接收数量。</li>
+          <li>点「推送当前角色」或「推送全部角色卡」，等进度跑完。</li>
+          <li>切回 MIU → 设置 → TT 互联 → 点「导入待接收卡片」，确认入库。</li>
+        </ol>
+        <p>连不上时：先确认 MIU 的接收服务开着；再确认 MIU 没有被系统冻结（可以分屏或锁定后台）。安卓切后台会冻结 App，所以推完请尽快切回 MIU 导入。</p>
+      </details>
+      <div class="miu-bridge-log" id="miu_bridge_log"></div>
+    </div>
+  </div>
+</div>`;
+    }
+
+    // ------------------------------------------------------------------
+    // 与 MIU 通信（TT 原生 MCP 客户端）
+    // ------------------------------------------------------------------
+
+    function isOurEndpoint(endpoint) {
+        return typeof endpoint === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(endpoint);
+    }
+
+    function portOf(endpoint) {
+        const match = /^http:\/\/127\.0\.0\.1:(\d+)\/mcp$/.exec(String(endpoint || ''));
+        return match ? Number(match[1]) : 0;
+    }
+
+    async function forgetOurRegistrations() {
+        const api = host().api.mcp;
+        let servers = [];
+        try {
+            const listed = await api.servers.list();
+            servers = (listed && Array.isArray(listed.servers)) ? listed.servers : [];
+        } catch (error) {
+            return;
+        }
+        for (const server of servers) {
+            if (!server || server.displayName !== DISPLAY_NAME || !isOurEndpoint(server.endpoint)) continue;
+            try { await api.servers.remove(server.id); } catch (error) { /* 删不掉就留着，不致命 */ }
+        }
+    }
+
+    async function ensurePermissions(tools) {
+        const api = host().api.mcp;
+        const names = Array.isArray(tools) && tools.length
+            ? tools.map(tool => tool && tool.nativeName).filter(name => typeof name === 'string')
+            : TOOL_NAMES;
+        for (const name of names) {
+            if (name.indexOf('miu_') !== 0) continue;
+            try {
+                await api.tools.setPermission({ registrationId: state.registrationId, nativeName: name, permission: 'allow' });
+            } catch (error) { /* 权限设不上就靠 ask，不阻断 */ }
+        }
+    }
+
+    function unwrapToolResult(result) {
+        if (!result || result.outcome !== 'known_response') throw new Error('bridge_unavailable');
+        const response = result.response;
+        if (!response || response.kind !== 'tool_result') throw new Error('bridge_rejected');
+        const text = response.structuredJson
+            || (Array.isArray(response.textBlocks) ? response.textBlocks.map(block => block.text).join('') : '');
+        let value = null;
+        if (text) {
+            try { value = JSON.parse(text); } catch (error) { throw new Error('bridge_bad_response'); }
+        }
+        if (response.isError) {
+            throw new Error((value && value.error) ? value.error : 'bridge_rejected');
+        }
+        if (!value) throw new Error('bridge_bad_response');
+        return value;
+    }
+
+    async function callToolLegacy(nativeName, argumentsJson) {
+        const safeInvoke = host().invoke.safeInvoke;
+        const executionCallId = crypto.randomUUID();
+        await safeInvoke('start_legacy_mcp_tool_call', { dto: { executionCallId } });
+        const result = await safeInvoke('call_legacy_mcp_tool', {
+            dto: {
+                executionCallId,
+                toolId: 'mcp/' + state.registrationId + ':' + nativeName,
+                argumentsJson,
+            },
+        });
+        return unwrapToolResult(result);
+    }
+
+    async function callTool(nativeName, args) {
+        if (!state.registrationId) throw new Error('not_connected');
+        const argumentsJson = JSON.stringify(args || {});
+
+        if (state.callMode !== 'legacy') {
+            let outcome;
+            try {
+                outcome = await host().api.mcp.tools.testCall({
+                    registrationId: state.registrationId,
+                    nativeName,
+                    argumentsJson,
+                });
+            } catch (error) {
+                if (state.callMode === 'test') throw error;
+                state.callMode = 'legacy';
+                return callToolLegacy(nativeName, argumentsJson);
+            }
+            state.callMode = 'test';
+            return unwrapToolResult(outcome);
+        }
+
+        return callToolLegacy(nativeName, argumentsJson);
+    }
+
+    function orderedPorts() {
+        const ports = [];
+        if (state.port > 0) ports.push(state.port);
+        for (const port of CANDIDATE_PORTS) {
+            if (ports.indexOf(port) < 0) ports.push(port);
+        }
+        return ports;
+    }
+
+    async function connect() {
+        const api = (await hostReady()).api.mcp;
+        await forgetOurRegistrations();
+
+        const settings = await extSettings();
+        state.port = Number(settings.port) > 0 ? Number(settings.port) : 0;
+
+        let reachedMiu = false;
+        let lastError = null;
+
+        for (const port of orderedPorts()) {
+            let created = null;
+            try {
+                created = await api.servers.create({
+                    displayName: DISPLAY_NAME,
+                    endpoint: 'http://127.0.0.1:' + port + '/mcp',
+                    headers: {},
+                    protocolVersion: 'auto',
+                });
+                await api.servers.setState({ registrationId: created.id, state: 'active' });
+                const discovery = await api.servers.discover(created.id);
+                const tools = (discovery && Array.isArray(discovery.tools)) ? discovery.tools : [];
+                if (!tools.some(tool => tool && tool.nativeName === 'miu_ping')) throw new Error('not_miu');
+                reachedMiu = true;
+
+                state.registrationId = created.id;
+                state.port = port;
+                state.callMode = null;
+                await ensurePermissions(tools);
+
+                const info = await callTool('miu_ping', {});
+                if (!info || info.ok !== true || info.app !== 'miu') throw new Error('not_miu');
+
+                settings.port = port;
+                await saveSettings();
+                state.connected = true;
+                return info;
+            } catch (error) {
+                lastError = error;
+                state.registrationId = null;
+                state.connected = false;
+                state.callMode = null;
+                if (created) {
+                    try { await api.servers.remove(created.id); } catch (ignore) { /* 清理失败无所谓 */ }
+                }
+            }
+        }
+
+        // 有到过 MIU 但没连成，就把真实原因抛出去，别一律说「没找到服务」
+        throw (reachedMiu && lastError) ? lastError : new Error('no_receiver');
+    }
+
+    async function ensureConnected() {
+        if (state.connected && state.registrationId) return;
+        await connect();
+    }
+
+    async function refreshStatus() {
+        const info = await callTool('miu_status', {});
+        state.connected = true;
+        setStatus('已连接 MIU · 端口 ' + info.port + ' · 待接收 ' + info.pending + ' 张（累计 ' + info.total + ' 张）', 'ok');
+        return info;
+    }
+
+    // ------------------------------------------------------------------
+    // 角色卡
+    // ------------------------------------------------------------------
+
+    function bytesToBase64(bytes) {
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 8192) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(offset, Math.min(offset + 8192, bytes.length)));
+        }
+        return btoa(binary);
+    }
+
+    async function exportCard(avatar) {
+        const headers = await requestHeaders();
+        const response = await fetch('/api/characters/export', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ avatar_url: avatar, format: 'png' }),
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('export_failed');
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length < 8 || bytes.length > MAX_CARD_BYTES) throw new Error('size_limit');
+        return bytes;
+    }
+
+    async function listCharacters() {
+        const response = await fetch('/api/characters/all', {
+            method: 'POST',
+            headers: await requestHeaders(),
+            body: '{}',
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('catalog_failed');
+        const list = await response.json();
+        if (!Array.isArray(list)) throw new Error('catalog_failed');
+        return list
+            .filter(character => character && typeof character.avatar === 'string' && character.avatar)
+            .map(character => ({
+                avatar: character.avatar,
+                name: String(character.name || '角色卡').slice(0, 120),
+            }));
+    }
+
+    function currentCharacter() {
+        const context = window.SillyTavern && typeof window.SillyTavern.getContext === 'function'
+            ? window.SillyTavern.getContext()
+            : null;
+        if (!context || context.groupId) return null;
+        const index = context.characterId;
+        const character = (index !== undefined && index !== null && index !== '')
+            ? (context.characters ? context.characters[index] : null)
+            : null;
+        if (!character || !character.avatar) return null;
+        return { avatar: character.avatar, name: String(character.name || '角色卡').slice(0, 120) };
+    }
+
+    async function pushOne(character, label) {
+        const bytes = await exportCard(character.avatar);
+        const begin = await callTool('miu_push_begin', { name: character.name || character.avatar, bytes: bytes.length });
+        const operationId = begin && begin.operationId;
+        if (!operationId) throw new Error('bridge_bad_response');
+
+        try {
+            const total = Math.ceil(bytes.length / CHUNK_BYTES);
+            for (let index = 0; index < total; index++) {
+                const slice = bytes.subarray(index * CHUNK_BYTES, Math.min((index + 1) * CHUNK_BYTES, bytes.length));
+                await callTool('miu_push_chunk', { operationId, index, data: bytesToBase64(slice) });
+                if (total > 1) setStatus('正在推送 ' + label + '：' + (index + 1) + ' / ' + total + ' 片');
+            }
+            return await callTool('miu_push_end', { operationId });
+        } catch (error) {
+            try { await callTool('miu_push_abort', { operationId }); } catch (ignore) { /* 放弃失败也无所谓 */ }
+            throw error;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 按钮
+    // ------------------------------------------------------------------
+
+    async function withBusy(task) {
+        if (state.busy) return;
+        state.busy = true;
+        try {
+            await task();
+        } catch (error) {
+            state.connected = state.connected && Boolean(state.registrationId);
+            setStatus(describe(error), 'error');
+            log(describe(error));
+        } finally {
+            state.busy = false;
+        }
+    }
+
+    function bindUi() {
+        const connectButton = document.getElementById('miu_bridge_connect');
+        const pushCurrentButton = document.getElementById('miu_bridge_push_current');
+        const pushAllButton = document.getElementById('miu_bridge_push_all');
+        const pendingButton = document.getElementById('miu_bridge_pending');
+
+        connectButton.addEventListener('click', function () {
+            withBusy(async function () {
+                setStatus('正在连接 MIU…');
+                log('开始连接，依次尝试端口 ' + orderedPorts().join('、') + '。');
+                const info = await connect();
+                log('连接成功：端口 ' + info.port + '。');
+                await refreshStatus();
+            });
+        });
+
+        pushCurrentButton.addEventListener('click', function () {
+            withBusy(async function () {
+                await ensureConnected();
+                const character = currentCharacter();
+                if (!character) throw new Error('select_character');
+                setStatus('正在推送「' + character.name + '」…');
+                const result = await pushOne(character, '「' + character.name + '」');
+                log('已推送：' + result.name + '（' + result.bytes + ' 字节）。');
+                await refreshStatus();
+                setStatus('已推送到 MIU：' + result.name + '。现在切回 MIU 点「导入待接收卡片」。', 'ok');
+            });
+        });
+
+        pushAllButton.addEventListener('click', function () {
+            withBusy(async function () {
+                await ensureConnected();
+                const characters = await listCharacters();
+                if (characters.length === 0) {
+                    setStatus('TT 里没有可推送的角色卡。', 'error');
+                    return;
+                }
+                if (!window.confirm('把 TT 里的 ' + characters.length + ' 张角色卡全部推送到 MIU？')) {
+                    setStatus('已取消。');
+                    return;
+                }
+
+                let done = 0;
+                let failed = 0;
+                let pending = 0;
+                for (let index = 0; index < characters.length; index++) {
+                    const character = characters[index];
+                    try {
+                        const result = await pushOne(character, '第 ' + (index + 1) + ' 张');
+                        if (result && typeof result.pending === 'number') pending = result.pending;
+                        done++;
+                    } catch (error) {
+                        failed++;
+                        log('推送失败：' + character.name + '（' + describe(error) + '）');
+                    }
+                    setStatus('推送中… 已推 ' + done + '/' + characters.length + ' 张（MIU 待接收 ' + pending + ' 张）');
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+
+                if (failed > 0) {
+                    setStatus('推送结束：成功 ' + done + ' 张，失败 ' + failed + ' 张。切回 MIU 点「导入待接收卡片」。', 'error');
+                } else {
+                    setStatus('推送结束：' + done + ' 张已送达 MIU。切回 MIU 点「导入待接收卡片」即可入库。', 'ok');
+                }
+                log('本轮推送完成。');
+            });
+        });
+
+        pendingButton.addEventListener('click', function () {
+            withBusy(async function () {
+                await ensureConnected();
+                const info = await callTool('miu_list_pending', {});
+                const names = (info.cards || []).map(card => card.name).slice(0, 5).join('、');
+                await refreshStatus();
+                log('MIU 待接收 ' + info.pending + ' 张：' + (names || '（空）'));
+            });
+        });
+    }
+
+    function mount() {
+        const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
+        if (!container) {
+            console.warn('[MIU 联动] 没找到扩展设置容器，面板未挂载。');
+            return false;
+        }
+        container.insertAdjacentHTML('beforeend', buildHtml());
+        bindUi();
+        console.log('[MIU 联动] 面板已挂载。');
+        return true;
+    }
+
+    function whenContainer() {
+        if (mount()) return;
+        let tries = 0;
+        const timer = setInterval(function () {
+            tries++;
+            if (mount() || tries > 60) clearInterval(timer);
+        }, 500);
+    }
+
+    function onReady(callback) {
+        if (typeof window.jQuery === 'function') {
+            window.jQuery(callback);
+            return;
+        }
+        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            setTimeout(callback, 0);
+            return;
+        }
+        document.addEventListener('DOMContentLoaded', callback, { once: true });
+    }
+
+    onReady(whenContainer);
+})();
