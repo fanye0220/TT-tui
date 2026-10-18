@@ -718,6 +718,43 @@
         return true;
     }
 
+    /**
+     * 队列里的字节是不是一本世界书。
+     * 酒馆世界书是顶层带 entries 的纯 JSON；角色卡一定带 spec / data 信封。
+     */
+    function isWorldbookBytes(bytes) {
+        try {
+            const text = new TextDecoder('utf-8').decode(bytes);
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+            if (parsed.spec) return false;
+            const entries = parsed.entries || (parsed.data ? parsed.data.entries : null);
+            return !!entries && typeof entries === 'object';
+        } catch (ignore) {
+            return false;
+        }
+    }
+
+    /** 把一本世界书导入酒馆的世界书目录（和角色卡走的接口不一样）。 */
+    async function importWorldbookToTavern(name, bytes) {
+        const headers = await requestHeaders();
+        delete headers['Content-Type'];
+        delete headers['content-type'];
+
+        const fileName = /\.json$/i.test(name) ? name : name + '.json';
+        const form = new FormData();
+        form.append('avatar', new Blob([bytes], { type: 'application/json' }), fileName);
+
+        const response = await fetch('/api/worldinfo/import', {
+            method: 'POST',
+            headers,
+            body: form,
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('worldbook_import_failed');
+        return true;
+    }
+
     /** 分片取回 MIU 里的一张待发送卡。 */
     async function fetchOutboxCard(meta, label) {
         const total = Math.max(1, Math.ceil(Number(meta.bytes) / CHUNK_BYTES));
@@ -759,7 +796,7 @@
         const list = await callTool('miu_outbox_list', {});
         const cards = Array.isArray(list.cards) ? list.cards : [];
         if (cards.length === 0) {
-            setStatus('MIU 里没有等待发送到酒馆的卡。', 'ok');
+            setStatus('MIU 里没有等待发送到酒馆的内容。', 'ok');
             log('待发送列表是空的。');
             return;
         }
@@ -771,25 +808,27 @@
             const fileName = cardFileName(meta.name);
             try {
                 const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
-                await importCardToTavern(fileName, bytes);
+                const isBook = /\.json$/i.test(fileName) && isWorldbookBytes(bytes);
+                if (isBook) await importWorldbookToTavern(fileName, bytes);
+                else await importCardToTavern(fileName, bytes);
                 await callTool('miu_outbox_ack', { id: meta.id });
                 done++;
-                log('已导入酒馆：' + fileName + '（' + bytes.length + ' 字节）');
+                log('已导入酒馆：' + fileName + '（' + (isBook ? '世界书，' : '') + bytes.length + ' 字节）');
             } catch (error) {
                 failed++;
                 log('导入失败：' + fileName + '（' + describe(error) + '）');
             }
             updateReceiveLabel(Math.max(0, cards.length - index - 1));
-            setStatus('接收中… 已导入 ' + done + ' / ' + cards.length + ' 张');
+            setStatus('接收中… 已导入 ' + done + ' / ' + cards.length + ' 项');
             await new Promise(resolve => setTimeout(resolve, 0));
         }
 
         await refreshTavernCharacters();
         await refreshStatus();
         if (failed > 0) {
-            setStatus('接收结束：成功 ' + done + ' 张，失败 ' + failed + ' 张（失败的那些还留在 MIU 队列里）。', 'error');
+            setStatus('接收结束：成功 ' + done + ' 项，失败 ' + failed + ' 项（失败的那些还留在 MIU 队列里）。', 'error');
         } else {
-            setStatus('接收结束：' + done + ' 张已导入酒馆。', 'ok');
+            setStatus('接收结束：' + done + ' 项已导入酒馆。', 'ok');
         }
         log('本轮接收完成。');
     }
