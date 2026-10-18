@@ -16,11 +16,19 @@
     const CANDIDATE_PORTS = [8791, 8792, 8793, 8794, 8795];
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
+    /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
+    const THUMB_MAX_SIDE = 112;
+    const THUMB_QUALITY = 0.72;
+    const THUMB_MAX_CHARS = 400 * 1024;
+    const THUMB_TIMEOUT_MS = 5000;
+    /** 一轮轮询最多渲染几张，别把轮询占太久。 */
+    const THUMB_PER_ROUND = 12;
     const TOOL_NAMES = [
         'miu_ping', 'miu_status', 'miu_push_begin',
         'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
         'miu_outbox_list', 'miu_outbox_fetch', 'miu_outbox_ack', 'miu_outbox_clear',
         'miu_pull_state', 'miu_pull_list', 'miu_pull_report',
+        'miu_thumb_data',
     ];
 
     const ERRORS = {
@@ -403,7 +411,12 @@
 
     async function pushOne(character, label) {
         const bytes = await exportCard(character.avatar);
-        const begin = await callTool('miu_push_begin', { name: character.name || character.avatar, bytes: bytes.length });
+        const thumb = await renderThumb(character.avatar);
+        const begin = await callTool('miu_push_begin', {
+            name: character.name || character.avatar,
+            bytes: bytes.length,
+            thumb: thumb,
+        });
         const operationId = begin && begin.operationId;
         if (!operationId) throw new Error('bridge_bad_response');
 
@@ -418,6 +431,45 @@
         } catch (error) {
             try { await callTool('miu_push_abort', { operationId }); } catch (ignore) { /* 放弃失败也无所谓 */ }
             throw error;
+        }
+    }
+
+    /** 从酒馆的缩略图渲染一张小头像（base64 JPEG，不带 data: 前缀）；取不到就返回空串。 */
+    async function renderThumb(avatar) {
+        try {
+            const module = await import('../../../../script.js');
+            if (typeof module.getThumbnailUrl !== 'function') return '';
+            const url = module.getThumbnailUrl('avatar', avatar);
+            if (!url) return '';
+
+            const image = new Image();
+            const loaded = new Promise(function (resolve, reject) {
+                image.onload = function () { resolve(); };
+                image.onerror = function () { reject(new Error('thumb_load_failed')); };
+                setTimeout(function () { reject(new Error('thumb_timeout')); }, THUMB_TIMEOUT_MS);
+            });
+            image.src = url;
+            await loaded;
+
+            const width = image.naturalWidth || image.width || 0;
+            const height = image.naturalHeight || image.height || 0;
+            if (!width || !height) return '';
+
+            const scale = Math.min(1, THUMB_MAX_SIDE / Math.max(width, height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(width * scale));
+            canvas.height = Math.max(1, Math.round(height * scale));
+            const context = canvas.getContext('2d');
+            if (!context) return '';
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+            const dataUrl = canvas.toDataURL('image/jpeg', THUMB_QUALITY);
+            const comma = dataUrl.indexOf(',');
+            if (comma < 0) return '';
+            const base64 = dataUrl.slice(comma + 1);
+            return base64.length > THUMB_MAX_CHARS ? '' : base64;
+        } catch (error) {
+            return '';
         }
     }
 
@@ -592,7 +644,35 @@
             await pullForMiu(picks);
             return true;
         }
+        const wanted = (task && Array.isArray(task.thumbWanted)) ? task.thumbWanted : [];
+        if (wanted.length > 0) {
+            await sendThumbsToMiu(wanted);
+            return true;
+        }
         return false;
+    }
+
+    /** MIU 要列表里那几张卡的头像：渲染成小图送过去（一轮最多 THUMB_PER_ROUND 张）。 */
+    async function sendThumbsToMiu(avatars) {
+        const items = [];
+        for (let index = 0; index < avatars.length && items.length < THUMB_PER_ROUND; index++) {
+            const avatar = avatars[index];
+            if (typeof avatar !== 'string' || !avatar) continue;
+            let data = '';
+            try {
+                data = await renderThumb(avatar);
+            } catch (error) {
+                data = '';
+            }
+            // 渲染不出来也回报一声，MIU 那边就不会反复要同一张
+            items.push({ avatar: avatar, data: data });
+        }
+        if (items.length === 0) return;
+        try {
+            await callTool('miu_thumb_data', { json: JSON.stringify(items) });
+        } catch (error) {
+            log('小头像发送失败：' + describe(error));
+        }
     }
 
     function updateReceiveLabel(count) {
