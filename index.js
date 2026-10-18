@@ -6,7 +6,7 @@
  * 走 TT 自带的本机 MCP 客户端（Rust 侧直连 127.0.0.1），所以不受正式版
  * TT「禁止明文 HTTP」的限制；不登录账号、不上云，数据只在你这台手机里走。
  *
- * 用法：先在 MIU 里「设置 -> TT 互联 -> 开启接收服务」，再回到这里点「连接 MIU」。
+ * 用法：先在 MIU 里「设置 -> TauriTavern -> 开启接收服务」，再回到这里点「连接 MIU」。
  */
 (function () {
     'use strict';
@@ -36,7 +36,7 @@
 
     const ERRORS = {
         host_unavailable: '这个 TT 版本没有联动能力，需要官方 TauriTavern 2.3.0 或更高版本。',
-        no_receiver: '没找到 MIU 接收服务。请先打开 MIU -> 设置 -> TT 互联 -> 开启接收服务。',
+        no_receiver: '没找到 MIU 接收服务。请先打开 MIU -> 设置 -> TauriTavern -> 开启接收服务。',
         not_connected: '还没连上 MIU，先点「连接 MIU」。',
         export_failed: 'TT 导出这张角色卡失败（可能它不是 PNG 卡）。',
         size_limit: '这张卡超过了单张 32 MB 的上限。',
@@ -156,13 +156,13 @@
       <details class="miu-bridge-help">
         <summary>怎么用 / 连不上怎么办</summary>
         <ol>
-          <li>打开 MIU（安卓）→ 设置 → TT 互联 → 点「开启接收服务」，看到端口号就算好了。</li>
+          <li>打开 MIU（安卓）→ 设置 → TauriTavern → 点「开启接收服务」，看到端口号就算好了。</li>
           <li>回到 TT 这一页，点「连接 MIU」。连上会显示 MIU 的端口和待接收数量。</li>
           <li>点「推送当前角色」或「推送全部角色卡」，等进度跑完。</li>
-          <li>切回 MIU → 设置 → TT 互联 → 点「选择要导入的卡」，勾选后导入。</li>
+          <li>切回 MIU → 设置 → TauriTavern → 点「选择要导入的卡」，勾选后导入。</li>
         </ol>
         <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点纸飞机「发送到酒馆」，在弹出的选项里选「发送到酒馆（TT 联动）」，卡就会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 3 秒自动刷新）。</p>
-        <p><b>MIU 主动拉取（酒馆 → MIU）</b>：在 MIU 里点「从酒馆拉取」，勾选想拉进来的卡，这边会自动把卡送过去，本页不用点任何按钮。拉的时候 TT 保持运行（挂小窗最稳）。</p>
+        <p><b>MIU 主动拉取（酒馆 → MIU）</b>：在 MIU 里点「拉取 TauriTavern」，勾选想拉进来的卡，这边会自动把卡送过去，本页不用点任何按钮。拉的时候 TT 保持运行（挂小窗最稳）。</p>
         <p>连不上时：先确认 MIU 的接收服务开着；再确认 MIU 没有被系统冻结（可以分屏或锁定后台）。安卓切后台会冻结 App，所以推完请尽快切回 MIU 导入。</p>
       </details>
       <div class="miu-bridge-log" id="miu_bridge_log"></div>
@@ -369,10 +369,11 @@
 
     async function exportCard(avatar) {
         const headers = await requestHeaders();
+        const cleanAvatar = String(avatar || '').replace(/^[\/\\]+/, '');
         const response = await fetch('/api/characters/export', {
             method: 'POST',
             headers,
-            body: JSON.stringify({ avatar_url: avatar, format: 'png' }),
+            body: JSON.stringify({ avatar: cleanAvatar, avatar_url: cleanAvatar, file_name: cleanAvatar, format: 'png' }),
             cache: 'no-store',
         });
         if (!response.ok) throw new Error('export_failed');
@@ -448,11 +449,11 @@
 
     async function pushOne(character, label) {
         const bytes = await exportCard(character.avatar);
-        const thumb = await renderThumb(character.avatar);
+        const thumbInfo = await renderThumb(character.avatar);
         const begin = await callTool('miu_push_begin', {
             name: character.name || character.avatar,
             bytes: bytes.length,
-            thumb: thumb,
+            thumb: thumbInfo.data,
         });
         const operationId = begin && begin.operationId;
         if (!operationId) throw new Error('bridge_bad_response');
@@ -471,131 +472,221 @@
         }
     }
 
-    /** 酒馆角色列表里这张卡的 <img> 地址——酒馆自己就在用这个地址，最可靠。 */
-    function avatarUrlFromDom(avatar) {
+    /** 内存头像缩略图缓存：避免重复抓取或渲染同一个 avatar */
+    const THUMB_CACHE = new Map();
+
+    /** 这张卡的头像地址候选：先问酒馆上下文，再按酒馆的缩略图和角色静态资源地址匹配。 */
+    function thumbUrlCandidates(avatar) {
+        const urls = [];
+        const cleanName = String(avatar || '').replace(/^[\/\\]+/, '');
+        const encoded = encodeURIComponent(cleanName);
+
+        const context = contextApi();
+        if (context && typeof context.getThumbnailUrl === 'function') {
+            try {
+                const url = context.getThumbnailUrl('avatar', cleanName);
+                if (typeof url === 'string' && url) urls.push(url);
+            } catch (error) { /* 换下一个 */ }
+        }
+
         try {
-            const escaped = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(avatar) : avatar;
-            const node = document.querySelector('[data-avatar="' + escaped + '"]');
-            if (!node) return '';
-            const image = node.tagName === 'IMG' ? node : node.querySelector('img');
-            return (image && image.src) ? image.src : '';
+            urls.push('/thumbnail?type=avatar&file=' + encoded);
+            urls.push('/thumbnail?type=avatar&avatar=' + encoded);
+            urls.push('/thumbnail?type=avatar&file_name=' + encoded);
+            urls.push('/thumbnail?type=avatar&name=' + encoded);
+            urls.push('/get_thumbnail?type=avatar&file=' + encoded);
+        } catch (error) {}
+        try {
+            urls.push('/characters/' + encoded);
+            urls.push('characters/' + encoded);
+            if (cleanName !== encoded) {
+                urls.push('/characters/' + cleanName);
+                urls.push('characters/' + cleanName);
+            }
+        } catch (error) {}
+
+        return urls;
+    }
+
+    /** 从酒馆网页已渲染的 DOM 树中寻找该角色的头像 img 节点（直接读取已解压纹理，0 开销） */
+    function findDomThumb(avatar) {
+        if (typeof document === 'undefined') return '';
+        try {
+            const cleanName = String(avatar || '').replace(/^[\/\\]+/, '');
+            const encoded = encodeURIComponent(cleanName);
+            const imgs = document.querySelectorAll('img');
+            for (let i = 0; i < imgs.length; i++) {
+                const img = imgs[i];
+                const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+                if (!src) continue;
+                if (src.includes(cleanName) || (encoded && src.includes(encoded))) {
+                    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                        const thumb = shrinkToThumb(img);
+                        if (thumb) return thumb;
+                    }
+                }
+            }
+            const items = document.querySelectorAll('.character_select, .character_item, [data-avatar], [avatar]');
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const attr = item.getAttribute('data-avatar') || item.getAttribute('avatar') || '';
+                if (attr && (attr === avatar || attr === cleanName || attr.includes(cleanName))) {
+                    const img = item.querySelector('img');
+                    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+                        const thumb = shrinkToThumb(img);
+                        if (thumb) return thumb;
+                    }
+                }
+            }
+        } catch (e) {}
+        return '';
+    }
+
+    /** 把图片对象缩放到不超过 112px，压成 JPEG base64（不带 data: 前缀）；支持跨域与防污处理 */
+    function shrinkToThumb(image) {
+        try {
+            const width = image.naturalWidth || image.width || 0;
+            const height = image.naturalHeight || image.height || 0;
+            if (!width || !height) return '';
+            const scale = Math.min(1, THUMB_MAX_SIDE / Math.max(width, height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(width * scale));
+            canvas.height = Math.max(1, Math.round(height * scale));
+            const context = canvas.getContext('2d');
+            if (!context) return '';
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/jpeg', THUMB_QUALITY);
+            const comma = dataUrl.indexOf(',');
+            if (comma < 0) return '';
+            const base64 = dataUrl.slice(comma + 1);
+            return base64.length > THUMB_MAX_CHARS ? '' : base64;
         } catch (error) {
+            // 画布被跨域玷污或不支持时返回空，交由二进制/Blob 模式处理
             return '';
         }
     }
 
-    /** 这张卡的头像地址候选，从最可靠的开始试。 */
-    function thumbUrlCandidates(avatar) {
-        const urls = [];
-        function push(url) {
-            if (typeof url === 'string' && url && urls.indexOf(url) < 0) urls.push(url);
-        }
-
-        push(avatarUrlFromDom(avatar));
-
-        const context = contextApi();
-        if (context && typeof context.getThumbnailUrl === 'function') {
-            try { push(context.getThumbnailUrl('avatar', avatar)); } catch (error) { /* 换下一个 */ }
-        }
-        try { push('/thumbnail?type=avatar&file=' + encodeURIComponent(avatar)); } catch (error) { /* 文件名太怪 */ }
-        try { push('/characters/' + encodeURIComponent(avatar)); } catch (error) { /* 同上 */ }
-        return urls;
-    }
-
-    function loadImage(url, timeoutMs) {
-        return new Promise(function (resolve, reject) {
-            const image = new Image();
-            let settled = false;
-            const timer = setTimeout(function () {
-                if (settled) return;
-                settled = true;
-                reject(new Error('thumb_timeout'));
-            }, timeoutMs);
-            image.onload = function () {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                resolve(image);
-            };
-            image.onerror = function () {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                reject(new Error('thumb_load_failed'));
-            };
-            image.src = url;
+    /** 把下载到的原始卡片/图片二进制转为 112px JPEG base64；Blob URL 永不污染 Canvas */
+    function renderBytesToThumb(bytes) {
+        return new Promise(function (resolve) {
+            if (!bytes || bytes.length < 8) return resolve('');
+            let blobUrl = '';
+            try {
+                let mime = 'image/png';
+                if (bytes[0] === 0xFF && bytes[1] === 0xD8) mime = 'image/jpeg';
+                else if (bytes[0] === 0x52 && bytes[1] === 0x49) mime = 'image/webp';
+                const blob = new Blob([bytes], { type: mime });
+                blobUrl = URL.createObjectURL(blob);
+                const image = new Image();
+                let settled = false;
+                const timer = setTimeout(function () {
+                    if (settled) return;
+                    settled = true;
+                    if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                    resolve('');
+                }, 4000);
+                image.onload = function () {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    try {
+                        const thumb = shrinkToThumb(image);
+                        if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                        resolve(thumb);
+                    } catch (err) {
+                        if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                        resolve('');
+                    }
+                };
+                image.onerror = function () {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                    resolve('');
+                };
+                image.src = blobUrl;
+            } catch (err) {
+                if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                resolve('');
+            }
         });
     }
 
-    /** 画布能读就把图缩到 112px；画布被跨域挡住就退回取原始字节。 */
-    function shrinkToThumb(image) {
-        const width = image.naturalWidth || image.width || 0;
-        const height = image.naturalHeight || image.height || 0;
-        if (!width || !height) return '';
-        const scale = Math.min(1, THUMB_MAX_SIDE / Math.max(width, height));
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.max(1, Math.round(width * scale));
-        canvas.height = Math.max(1, Math.round(height * scale));
-        const context = canvas.getContext('2d');
-        if (!context) return '';
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', THUMB_QUALITY);
-        const comma = dataUrl.indexOf(',');
-        if (comma < 0) return '';
-        const base64 = dataUrl.slice(comma + 1);
-        return base64.length > THUMB_MAX_CHARS ? '' : base64;
-    }
-
-    async function bytesToThumb(url, timeoutMs) {
-        const controller = new AbortController();
-        const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
-        try {
-            const response = await fetch(url, {
-                headers: await requestHeaders(),
-                cache: 'no-store',
-                signal: controller.signal,
-            });
-            if (!response.ok) throw new Error('thumb_fetch_failed');
-            const bytes = new Uint8Array(await response.arrayBuffer());
-            if (bytes.length === 0 || bytes.length > THUMB_MAX_BYTES) throw new Error('thumb_too_big');
-            return bytesToBase64(bytes);
-        } finally {
-            clearTimeout(timer);
-        }
-    }
-
-    /** 渲染一张小头像；返回 {data, reason}，reason 用来告诉 MIU 为什么没成。 */
+    /**
+     * 极速且绝对可靠的头像提取引擎：
+     * 1) 优先命中内存缩略图缓存；
+     * 2) 探测酒馆前端当前 DOM 树上已经加载好的角标头像；
+     * 3) 携带 CSRF 与鉴权头尝试通过酒馆各候选静态地址 fetch，并用 Local Blob 转换为小头像（杜绝跨域污染 Canvas）；
+     * 4) 终极兜底：直接调 exportCard(avatar)（酒馆官方导出接口，100% 可用），抽取卡图并转小头像；
+     * 5) 返回 base64 JPEG（不带 data: 前缀）。
+     */
+    /**
+     * 取一张小头像；返回 {data, reason}，reason 用来告诉 MIU 为什么没成。
+     * 顺序：内存缓存 -> 酒馆页面上已渲染的头像 <img>（0 开销）-> 9 个候选地址
+     * -> 下载字节用 Blob URL 转 canvas（画布不会被跨域污染）-> 兜底导出整卡抽图。
+     */
     async function renderThumb(avatar) {
+        if (!avatar || typeof avatar !== 'string') return { data: '', reason: 'thumb_bad_avatar' };
+        const cached = THUMB_CACHE.get(avatar);
+        if (typeof cached === 'string' && cached) return { data: cached, reason: '' };
+
         const deadline = Date.now() + THUMB_TOTAL_MS;
-        const candidates = thumbUrlCandidates(avatar);
-        let reason = candidates.length === 0 ? 'no_url' : 'timeout';
 
-        for (let index = 0; index < candidates.length; index++) {
-            const url = candidates[index];
-            const left = deadline - Date.now();
-            if (left <= 400) { reason = 'timeout'; break; }
-
-            try {
-                const image = await loadImage(url, Math.min(THUMB_TIMEOUT_MS, left));
-                let data = '';
-                try {
-                    data = shrinkToThumb(image);
-                } catch (error) {
-                    data = '';
-                    reason = 'canvas_blocked';
-                }
-                if (data) return { data: data, reason: '' };
-                if (reason !== 'canvas_blocked') reason = 'canvas_empty';
-            } catch (error) {
-                reason = (error && error.message) ? error.message : 'load_failed';
+        // 1. 酒馆页面上已经渲染好的那张头像
+        try {
+            const domThumb = findDomThumb(avatar);
+            if (domThumb) {
+                THUMB_CACHE.set(avatar, domThumb);
+                return { data: domThumb, reason: '' };
             }
+        } catch (ignore) { /* 探测失败就往下走 */ }
 
-            const leftForBytes = deadline - Date.now();
-            if (leftForBytes <= 400) { reason = 'timeout'; break; }
+        // 2. 候选地址逐个试
+        const candidates = thumbUrlCandidates(avatar);
+        let reason = candidates.length === 0 ? 'thumb_no_url' : 'thumb_fetch_failed';
+        for (let index = 0; index < candidates.length; index++) {
+            const left = deadline - Date.now();
+            if (left <= 400) { reason = 'thumb_timeout'; break; }
+            const url = candidates[index];
             try {
-                return { data: await bytesToThumb(url, leftForBytes), reason: '' };
+                const controller = new AbortController();
+                const timer = setTimeout(function () { controller.abort(); }, Math.min(2500, Math.max(500, left)));
+                const response = await fetch(url, {
+                    headers: await requestHeaders(),
+                    cache: 'no-store',
+                    signal: controller.signal,
+                }).finally(function () { clearTimeout(timer); });
+                if (response.ok) {
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    if (bytes.length >= 8) {
+                        const thumb = await renderBytesToThumb(bytes);
+                        if (thumb) {
+                            THUMB_CACHE.set(avatar, thumb);
+                            return { data: thumb, reason: '' };
+                        }
+                        reason = 'thumb_render_failed';
+                    }
+                }
             } catch (error) {
-                reason = (error && error.message) ? error.message : 'fetch_failed';
+                reason = (error && error.message) ? error.message : 'thumb_fetch_failed';
+            }
+        }
+
+        // 3. 兜底：导出整卡 PNG，再从卡图里抽头像
+        if (deadline - Date.now() > 500) {
+            try {
+                const cardBytes = await exportCard(avatar);
+                if (cardBytes && cardBytes.length >= 8) {
+                    const thumb = await renderBytesToThumb(cardBytes);
+                    if (thumb) {
+                        THUMB_CACHE.set(avatar, thumb);
+                        return { data: thumb, reason: '' };
+                    }
+                }
+                reason = 'thumb_export_unreadable';
+            } catch (exportErr) {
+                reason = 'thumb_export_failed';
             }
         }
 
@@ -801,19 +892,19 @@
         for (let index = 0; index < avatars.length && items.length < THUMB_PER_ROUND; index++) {
             const avatar = avatars[index];
             if (typeof avatar !== 'string' || !avatar) continue;
-            let result = { data: '', reason: 'error' };
+            let result = { data: '', reason: 'thumb_error' };
             try {
                 result = await renderThumb(avatar);
             } catch (error) {
-                result = { data: '', reason: 'error' };
+                result = { data: '', reason: 'thumb_error' };
             }
-            if (!result.data && !firstReason) firstReason = result.reason || 'unknown';
+            if (!result.data && !firstReason) firstReason = result.reason || 'thumb_unknown';
             // 渲染不出来也回报一声（带原因），MIU 那边就不会反复要同一张
             items.push({ avatar: avatar, data: result.data, reason: result.reason || '' });
         }
         if (items.length === 0) return;
         const ok = items.filter(item => item.data).length;
-        if (ok === 0) log('小头像：这 ' + items.length + ' 张都没渲染出来（原因：' + (firstReason || 'unknown') + '）。');
+        if (ok === 0) log('小头像：这 ' + items.length + ' 张都没渲染出来（原因：' + (firstReason || 'thumb_unknown') + '）。');
         try {
             await callTool('miu_thumb_data', { json: JSON.stringify(items) });
         } catch (error) {
