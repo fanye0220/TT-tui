@@ -471,19 +471,34 @@
         }
     }
 
-    /** 这张卡的头像地址候选：先问酒馆上下文，再按酒馆的缩略图地址自己拼一份。 */
+    /** 酒馆角色列表里这张卡的 <img> 地址——酒馆自己就在用这个地址，最可靠。 */
+    function avatarUrlFromDom(avatar) {
+        try {
+            const escaped = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(avatar) : avatar;
+            const node = document.querySelector('[data-avatar="' + escaped + '"]');
+            if (!node) return '';
+            const image = node.tagName === 'IMG' ? node : node.querySelector('img');
+            return (image && image.src) ? image.src : '';
+        } catch (error) {
+            return '';
+        }
+    }
+
+    /** 这张卡的头像地址候选，从最可靠的开始试。 */
     function thumbUrlCandidates(avatar) {
         const urls = [];
+        function push(url) {
+            if (typeof url === 'string' && url && urls.indexOf(url) < 0) urls.push(url);
+        }
+
+        push(avatarUrlFromDom(avatar));
+
         const context = contextApi();
         if (context && typeof context.getThumbnailUrl === 'function') {
-            try {
-                const url = context.getThumbnailUrl('avatar', avatar);
-                if (typeof url === 'string' && url) urls.push(url);
-            } catch (error) { /* 换下一个 */ }
+            try { push(context.getThumbnailUrl('avatar', avatar)); } catch (error) { /* 换下一个 */ }
         }
-        try {
-            urls.push('/thumbnail?type=avatar&file=' + encodeURIComponent(avatar));
-        } catch (error) { /* 文件名太怪就跳过 */ }
+        try { push('/thumbnail?type=avatar&file=' + encodeURIComponent(avatar)); } catch (error) { /* 文件名太怪 */ }
+        try { push('/characters/' + encodeURIComponent(avatar)); } catch (error) { /* 同上 */ }
         return urls;
     }
 
@@ -549,29 +564,42 @@
         }
     }
 
-    /** 渲染一张小头像（base64 JPEG，不带 data: 前缀）；整体最多花 THUMB_TOTAL_MS，取不到返回空串。 */
+    /** 渲染一张小头像；返回 {data, reason}，reason 用来告诉 MIU 为什么没成。 */
     async function renderThumb(avatar) {
         const deadline = Date.now() + THUMB_TOTAL_MS;
         const candidates = thumbUrlCandidates(avatar);
+        let reason = candidates.length === 0 ? 'no_url' : 'timeout';
 
         for (let index = 0; index < candidates.length; index++) {
             const url = candidates[index];
             const left = deadline - Date.now();
-            if (left <= 400) break;
+            if (left <= 400) { reason = 'timeout'; break; }
+
             try {
                 const image = await loadImage(url, Math.min(THUMB_TIMEOUT_MS, left));
-                const data = shrinkToThumb(image);
-                if (data) return data;
-            } catch (error) { /* 换下一个地址 */ }
+                let data = '';
+                try {
+                    data = shrinkToThumb(image);
+                } catch (error) {
+                    data = '';
+                    reason = 'canvas_blocked';
+                }
+                if (data) return { data: data, reason: '' };
+                if (reason !== 'canvas_blocked') reason = 'canvas_empty';
+            } catch (error) {
+                reason = (error && error.message) ? error.message : 'load_failed';
+            }
 
             const leftForBytes = deadline - Date.now();
-            if (leftForBytes <= 400) break;
+            if (leftForBytes <= 400) { reason = 'timeout'; break; }
             try {
-                return await bytesToThumb(url, leftForBytes);
-            } catch (error) { /* 这张真取不到 */ }
+                return { data: await bytesToThumb(url, leftForBytes), reason: '' };
+            } catch (error) {
+                reason = (error && error.message) ? error.message : 'fetch_failed';
+            }
         }
 
-        return '';
+        return { data: '', reason: reason };
     }
 
     // ------------------------------------------------------------------
@@ -769,21 +797,23 @@
     /** MIU 要列表里那几张卡的头像：渲染成小图送过去（一轮最多 THUMB_PER_ROUND 张）。 */
     async function sendThumbsToMiu(avatars) {
         const items = [];
+        let firstReason = '';
         for (let index = 0; index < avatars.length && items.length < THUMB_PER_ROUND; index++) {
             const avatar = avatars[index];
             if (typeof avatar !== 'string' || !avatar) continue;
-            let data = '';
+            let result = { data: '', reason: 'error' };
             try {
-                data = await renderThumb(avatar);
+                result = await renderThumb(avatar);
             } catch (error) {
-                data = '';
+                result = { data: '', reason: 'error' };
             }
-            // 渲染不出来也回报一声，MIU 那边就不会反复要同一张
-            items.push({ avatar: avatar, data: data });
+            if (!result.data && !firstReason) firstReason = result.reason || 'unknown';
+            // 渲染不出来也回报一声（带原因），MIU 那边就不会反复要同一张
+            items.push({ avatar: avatar, data: result.data, reason: result.reason || '' });
         }
         if (items.length === 0) return;
         const ok = items.filter(item => item.data).length;
-        if (ok === 0) log('小头像：这 ' + items.length + ' 张都没渲染出来（酒馆可能没在运行或没登录）。');
+        if (ok === 0) log('小头像：这 ' + items.length + ' 张都没渲染出来（原因：' + (firstReason || 'unknown') + '）。');
         try {
             await callTool('miu_thumb_data', { json: JSON.stringify(items) });
         } catch (error) {
