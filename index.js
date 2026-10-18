@@ -20,6 +20,9 @@
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
     const THUMB_MAX_CHARS = 400 * 1024;
+    /** 单张头像的字节上限，以及整个渲染过程的时间预算。 */
+    const THUMB_MAX_BYTES = 400 * 1024;
+    const THUMB_TOTAL_MS = 4000;
     const THUMB_TIMEOUT_MS = 5000;
     /** 一轮轮询最多渲染几张，别把轮询占太久。 */
     const THUMB_PER_ROUND = 12;
@@ -28,7 +31,7 @@
         'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
         'miu_outbox_list', 'miu_outbox_fetch', 'miu_outbox_ack', 'miu_outbox_clear',
         'miu_pull_state', 'miu_pull_list', 'miu_pull_report',
-        'miu_thumb_data',
+        'miu_thumb_data', 'miu_pull_error',
     ];
 
     const ERRORS = {
@@ -378,7 +381,41 @@
         return bytes;
     }
 
+    /** 酒馆前端上下文：角色列表和缩略图地址都从这里拿，不用碰 HTTP 接口。 */
+    function contextApi() {
+        try {
+            if (window.SillyTavern && typeof window.SillyTavern.getContext === 'function') {
+                return window.SillyTavern.getContext() || null;
+            }
+        } catch (error) { /* 拿不到就当没有 */ }
+        return null;
+    }
+
+    /** 酒馆内存里已经加载好的角色列表（最快，发送前不用等下载）。 */
+    function catalogueFromContext() {
+        const context = contextApi();
+        const characters = context && Array.isArray(context.characters) ? context.characters : null;
+        if (!characters) return null;
+        return characters
+            .filter(character => character && typeof character.avatar === 'string' && character.avatar)
+            .map(character => ({
+                avatar: character.avatar,
+                name: String(character.name || '角色卡').slice(0, 120),
+            }));
+    }
+
+    /** 优先用内存里的列表；内存里没有才让酒馆重新加载；最后才退回接口。 */
     async function listCharacters() {
+        let list = catalogueFromContext();
+        if (list && list.length > 0) return list;
+
+        try {
+            const context = contextApi();
+            if (context && typeof context.getCharacters === 'function') await context.getCharacters();
+        } catch (error) { /* 刷不出来再走接口 */ }
+        list = catalogueFromContext();
+        if (list && list.length > 0) return list;
+
         const response = await fetch('/api/characters/all', {
             method: 'POST',
             headers: await requestHeaders(),
@@ -386,9 +423,9 @@
             cache: 'no-store',
         });
         if (!response.ok) throw new Error('catalog_failed');
-        const list = await response.json();
-        if (!Array.isArray(list)) throw new Error('catalog_failed');
-        return list
+        const remote = await response.json();
+        if (!Array.isArray(remote)) throw new Error('catalog_failed');
+        return remote
             .filter(character => character && typeof character.avatar === 'string' && character.avatar)
             .map(character => ({
                 avatar: character.avatar,
@@ -434,43 +471,107 @@
         }
     }
 
-    /** 从酒馆的缩略图渲染一张小头像（base64 JPEG，不带 data: 前缀）；取不到就返回空串。 */
-    async function renderThumb(avatar) {
-        try {
-            const module = await import('../../../../script.js');
-            if (typeof module.getThumbnailUrl !== 'function') return '';
-            const url = module.getThumbnailUrl('avatar', avatar);
-            if (!url) return '';
-
-            const image = new Image();
-            const loaded = new Promise(function (resolve, reject) {
-                image.onload = function () { resolve(); };
-                image.onerror = function () { reject(new Error('thumb_load_failed')); };
-                setTimeout(function () { reject(new Error('thumb_timeout')); }, THUMB_TIMEOUT_MS);
-            });
-            image.src = url;
-            await loaded;
-
-            const width = image.naturalWidth || image.width || 0;
-            const height = image.naturalHeight || image.height || 0;
-            if (!width || !height) return '';
-
-            const scale = Math.min(1, THUMB_MAX_SIDE / Math.max(width, height));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.round(width * scale));
-            canvas.height = Math.max(1, Math.round(height * scale));
-            const context = canvas.getContext('2d');
-            if (!context) return '';
-            context.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-            const dataUrl = canvas.toDataURL('image/jpeg', THUMB_QUALITY);
-            const comma = dataUrl.indexOf(',');
-            if (comma < 0) return '';
-            const base64 = dataUrl.slice(comma + 1);
-            return base64.length > THUMB_MAX_CHARS ? '' : base64;
-        } catch (error) {
-            return '';
+    /** 这张卡的头像地址候选：先问酒馆上下文，再按酒馆的缩略图地址自己拼一份。 */
+    function thumbUrlCandidates(avatar) {
+        const urls = [];
+        const context = contextApi();
+        if (context && typeof context.getThumbnailUrl === 'function') {
+            try {
+                const url = context.getThumbnailUrl('avatar', avatar);
+                if (typeof url === 'string' && url) urls.push(url);
+            } catch (error) { /* 换下一个 */ }
         }
+        try {
+            urls.push('/thumbnail?type=avatar&file=' + encodeURIComponent(avatar));
+        } catch (error) { /* 文件名太怪就跳过 */ }
+        return urls;
+    }
+
+    function loadImage(url, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+            const image = new Image();
+            let settled = false;
+            const timer = setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                reject(new Error('thumb_timeout'));
+            }, timeoutMs);
+            image.onload = function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(image);
+            };
+            image.onerror = function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error('thumb_load_failed'));
+            };
+            image.src = url;
+        });
+    }
+
+    /** 画布能读就把图缩到 112px；画布被跨域挡住就退回取原始字节。 */
+    function shrinkToThumb(image) {
+        const width = image.naturalWidth || image.width || 0;
+        const height = image.naturalHeight || image.height || 0;
+        if (!width || !height) return '';
+        const scale = Math.min(1, THUMB_MAX_SIDE / Math.max(width, height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        const context = canvas.getContext('2d');
+        if (!context) return '';
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', THUMB_QUALITY);
+        const comma = dataUrl.indexOf(',');
+        if (comma < 0) return '';
+        const base64 = dataUrl.slice(comma + 1);
+        return base64.length > THUMB_MAX_CHARS ? '' : base64;
+    }
+
+    async function bytesToThumb(url, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+        try {
+            const response = await fetch(url, {
+                headers: await requestHeaders(),
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            if (!response.ok) throw new Error('thumb_fetch_failed');
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            if (bytes.length === 0 || bytes.length > THUMB_MAX_BYTES) throw new Error('thumb_too_big');
+            return bytesToBase64(bytes);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** 渲染一张小头像（base64 JPEG，不带 data: 前缀）；整体最多花 THUMB_TOTAL_MS，取不到返回空串。 */
+    async function renderThumb(avatar) {
+        const deadline = Date.now() + THUMB_TOTAL_MS;
+        const candidates = thumbUrlCandidates(avatar);
+
+        for (let index = 0; index < candidates.length; index++) {
+            const url = candidates[index];
+            const left = deadline - Date.now();
+            if (left <= 400) break;
+            try {
+                const image = await loadImage(url, Math.min(THUMB_TIMEOUT_MS, left));
+                const data = shrinkToThumb(image);
+                if (data) return data;
+            } catch (error) { /* 换下一个地址 */ }
+
+            const leftForBytes = deadline - Date.now();
+            if (leftForBytes <= 400) break;
+            try {
+                return await bytesToThumb(url, leftForBytes);
+            } catch (error) { /* 这张真取不到 */ }
+        }
+
+        return '';
     }
 
     // ------------------------------------------------------------------
@@ -520,6 +621,13 @@
     }
 
     async function refreshTavernCharacters() {
+        try {
+            const context = contextApi();
+            if (context && typeof context.getCharacters === 'function') {
+                await context.getCharacters();
+                return;
+            }
+        } catch (error) { /* 换 script.js 再试 */ }
         try {
             const module = await import('../../../../script.js');
             if (typeof module.getCharacters === 'function') await module.getCharacters();
@@ -576,11 +684,17 @@
 
     /** MIU 要角色列表：把酒馆的卡列表送过去，让它显示出来给用户勾选。 */
     async function sendCatalogToMiu() {
-        const list = await listCharacters();
-        state.catalog = list;
-        await callTool('miu_pull_list', { json: JSON.stringify(list) });
-        setStatus('已把酒馆里的 ' + list.length + ' 张角色卡发给 MIU，去 MIU 里勾选要拉哪几张。', 'ok');
-        log('已把 ' + list.length + ' 张角色卡发给 MIU。');
+        try {
+            const list = await listCharacters();
+            state.catalog = list;
+            await callTool('miu_pull_list', { json: JSON.stringify(list) });
+            setStatus('已把酒馆里的 ' + list.length + ' 张角色卡发给 MIU，去 MIU 里勾选要拉哪几张。', 'ok');
+            log('已把 ' + list.length + ' 张角色卡发给 MIU。');
+        } catch (error) {
+            const reason = describe(error);
+            log('读取角色列表失败：' + reason);
+            try { await callTool('miu_pull_error', { message: reason }); } catch (ignore) { /* 报不上去也只是少条提示 */ }
+        }
     }
 
     /** MIU 勾好之后：逐张导出 PNG 推进 MIU 的待接收队列，最后把新卡 id 回报过去。 */
@@ -668,6 +782,8 @@
             items.push({ avatar: avatar, data: data });
         }
         if (items.length === 0) return;
+        const ok = items.filter(item => item.data).length;
+        if (ok === 0) log('小头像：这 ' + items.length + ' 张都没渲染出来（酒馆可能没在运行或没登录）。');
         try {
             await callTool('miu_thumb_data', { json: JSON.stringify(items) });
         } catch (error) {
@@ -681,24 +797,31 @@
         button.textContent = count > 0 ? (RECEIVE_LABEL + ' (' + count + ')') : RECEIVE_LABEL;
     }
 
+    async function pollOnce() {
+        if (!state.connected || !state.registrationId || state.busy || state.pullBusy) return;
+        try {
+            const list = await callTool('miu_outbox_list', {});
+            updateReceiveLabel(Number(list.count) || 0);
+        } catch (error) { /* 轮询失败不打扰用户 */ }
+
+        if (!state.connected || !state.registrationId || state.busy || state.pullBusy) return;
+        state.pullBusy = true;
+        try {
+            await handlePullRequests();
+        } catch (error) {
+            log('处理 MIU 的拉取请求失败：' + describe(error));
+        } finally {
+            state.pullBusy = false;
+        }
+    }
+
     function startOutboxPolling() {
         if (outboxTimer) return;
-        outboxTimer = setInterval(async function () {
-            if (!state.connected || !state.registrationId || state.busy || state.pullBusy) return;
-            try {
-                const list = await callTool('miu_outbox_list', {});
-                updateReceiveLabel(Number(list.count) || 0);
-            } catch (error) { /* 轮询失败不打扰用户 */ }
-
-            state.pullBusy = true;
-            try {
-                await handlePullRequests();
-            } catch (error) {
-                log('处理 MIU 的拉取请求失败：' + describe(error));
-            } finally {
-                state.pullBusy = false;
-            }
-        }, 3000);
+        outboxTimer = setInterval(pollOnce, 3000);
+        // 酒馆在后台时定时器会被系统降频甚至停摆，回到前台的瞬间补一次，MIU 那边就不用干等。
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') pollOnce();
+        });
     }
 
     // ------------------------------------------------------------------
