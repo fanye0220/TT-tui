@@ -16,6 +16,8 @@
     const CANDIDATE_PORTS = [8791, 8792, 8793, 8794, 8795];
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
+    /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
+    const BUILD_TAG = '10-19 世界书支持版';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -154,7 +156,7 @@
         <div class="menu_button" id="miu_bridge_receive">接收 MIU 推送</div>
       </div>
       <details class="miu-bridge-help">
-        <summary>怎么用 / 连不上怎么办</summary>
+        <summary>怎么用 / 连不上怎么办（扩展 ${BUILD_TAG}）</summary>
         <ol>
           <li>打开 MIU（安卓）→ 设置 → TauriTavern → 点「开启接收服务」，看到端口号就算好了。</li>
           <li>回到 TT 这一页，点「连接 MIU」。连上会显示 MIU 的端口和待接收数量。</li>
@@ -719,31 +721,65 @@
     }
 
     /**
-     * 队列里的字节是不是一本世界书。
-     * 酒馆世界书是顶层带 entries 的纯 JSON；角色卡一定带 spec / data 信封。
+     * 队列里的字节是不是一本世界书；是就返回「摊平后」的 JSON 文本（顶层一定是 entries），不是就返回 null。
+     * 角色卡一定带 spec / data 信封，且带 first_mes / personality 这类卡字段，靠这个区分。
+     * 老版 MIU 导出的世界书会把条目包在 character_book / data.character_book 里，这里一并认出来，
+     * 免得被当成角色卡送给酒馆（那会被回一句 Character name is missing）。
      */
-    function isWorldbookBytes(bytes) {
+    function worldbookPayload(bytes) {
+        let parsed = null;
         try {
-            const text = new TextDecoder('utf-8').decode(bytes);
-            const parsed = JSON.parse(text);
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-            if (parsed.spec) return false;
-            const entries = parsed.entries || (parsed.data ? parsed.data.entries : null);
-            return !!entries && typeof entries === 'object';
+            parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes));
         } catch (ignore) {
-            return false;
+            return null;
         }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+        // 角色卡的标志：spec 信封，或者卡字段（哪怕值是空字符串也算，用「有没有这个键」判断）
+        const cardFields = ['spec', 'first_mes', 'mes_example', 'personality', 'scenario', 'system_prompt', 'post_history_instructions'];
+        for (let i = 0; i < cardFields.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(parsed, cardFields[i])) return null;
+            if (parsed.data && Object.prototype.hasOwnProperty.call(parsed.data, cardFields[i])) return null;
+        }
+
+        const found = findWorldbookEntries(parsed, 0);
+        if (!found) return null;
+
+        const flat = Object.assign({}, parsed, found.owner === parsed ? {} : found.owner);
+        delete flat.spec;
+        delete flat.spec_version;
+        delete flat.data;
+        delete flat.character_book;
+        delete flat.extensions;
+        delete flat.world_info;
+        delete flat.lorebook;
+        flat.entries = found.entries;
+        return JSON.stringify(flat, null, 2);
+    }
+
+    /** 在对象里递归找世界书的 entries（可能被包在 data / character_book / extensions 里，最多找 4 层）。 */
+    function findWorldbookEntries(value, depth) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        if (depth > 4) return null;
+        if (value.entries && typeof value.entries === 'object') {
+            return { entries: value.entries, owner: value };
+        }
+        const containers = ['character_book', 'extensions', 'data'];
+        for (let i = 0; i < containers.length; i++) {
+            const hit = findWorldbookEntries(value[containers[i]], depth + 1);
+            if (hit) return hit;
+        }
+        return null;
     }
 
     /** 把一本世界书导入酒馆的世界书目录（和角色卡走的接口不一样）。 */
-    async function importWorldbookToTavern(name, bytes) {
+    async function importWorldbookToTavern(name, payload) {
         const headers = await requestHeaders();
         delete headers['Content-Type'];
         delete headers['content-type'];
 
         const fileName = /\.json$/i.test(name) ? name : name + '.json';
         const form = new FormData();
-        form.append('avatar', new Blob([bytes], { type: 'application/json' }), fileName);
+        form.append('avatar', new Blob([payload], { type: 'application/json' }), fileName);
 
         const response = await fetch('/api/worldinfo/import', {
             method: 'POST',
@@ -808,12 +844,12 @@
             const fileName = cardFileName(meta.name);
             try {
                 const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
-                const isBook = /\.json$/i.test(fileName) && isWorldbookBytes(bytes);
-                if (isBook) await importWorldbookToTavern(fileName, bytes);
+                const book = /\.json$/i.test(fileName) ? worldbookPayload(bytes) : null;
+                if (book) await importWorldbookToTavern(fileName, book);
                 else await importCardToTavern(fileName, bytes);
                 await callTool('miu_outbox_ack', { id: meta.id });
                 done++;
-                log('已导入酒馆：' + fileName + '（' + (isBook ? '世界书，' : '') + bytes.length + ' 字节）');
+                log('已导入酒馆：' + fileName + '（' + (book ? '世界书，' : '') + bytes.length + ' 字节）');
             } catch (error) {
                 failed++;
                 log('导入失败：' + fileName + '（' + describe(error) + '）');
@@ -1014,7 +1050,7 @@
                 setStatus('正在连接 MIU…');
                 log('开始连接，依次尝试端口 ' + orderedPorts().join('、') + '。');
                 const info = await connect();
-                log('连接成功：端口 ' + info.port + '。');
+                log('连接成功：端口 ' + info.port + '（扩展 ' + BUILD_TAG + '）。');
                 await refreshStatus();
             });
         });
