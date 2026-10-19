@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 工具推送版';
+    const BUILD_TAG = '10-19 工具推送版3';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -54,6 +54,7 @@
         qr_import_failed: '酒馆拒绝了这个快速回复集合。',
         regex_import_failed: '写不进正则：这里不是酒馆页面内部。',
         unsupported_script: '这份「脚本」不是酒馆正则（酒馆助手那种 JS 脚本没有导入接口），没推过去，还留在 MIU 队列里。',
+        unknown_json: '认不出这份 JSON 是哪一类数据（角色卡 / 世界书 / 预设 / 美化 / 快速回复 / 正则），没敢直接导，还留在 MIU 队列里。',
     };
 
     const state = {
@@ -802,9 +803,18 @@
     }
 
     /** 队列里的字节属于哪一类数据；认不出来就返回 null（当角色卡处理）。 */
-    function sniffJsonPayload(bytes) {
-        const book = worldbookPayload(bytes);
-        if (book) return { kind: 'worldbook', label: '世界书', payload: book };
+    /** 文件名里的类型提示：App 推工具数据时会写成 xxx.preset.json 这种，不用再靠猜。 */
+    function hintFromFileName(fileName) {
+        const match = /\.(worldbook|preset|theme|qr|regex|script)\.json$/i.exec(String(fileName || ''));
+        return match ? match[1].toLowerCase() : null;
+    }
+
+    /** 队列里的字节属于哪一类数据：文件名带类型就按它来，不带再按内容猜；实在认不出就报 unknown。 */
+    function sniffJsonPayload(bytes, hint) {
+        if (hint === 'worldbook') {
+            const book = worldbookPayload(bytes);
+            return book ? { kind: 'worldbook', label: '世界书', payload: book } : null;
+        }
 
         let parsed = null;
         try {
@@ -813,6 +823,33 @@
             return null;
         }
         if (!parsed || typeof parsed !== 'object') return null;
+
+        if (hint === 'preset') {
+            const picked = pickPresetPayload(parsed);
+            const preset = picked
+                ? picked.preset
+                : (parsed.preset && typeof parsed.preset === 'object' && !Array.isArray(parsed.preset) ? parsed.preset : parsed);
+            return {
+                kind: 'preset',
+                label: '预设',
+                payload: { apiId: picked ? picked.apiId : guessPresetApiId(preset), preset: preset },
+            };
+        }
+        if (hint === 'theme') {
+            const theme = pickThemePayload(parsed)
+                || (parsed.theme && typeof parsed.theme === 'object' && !Array.isArray(parsed.theme) ? parsed.theme : parsed);
+            return { kind: 'theme', label: '美化', payload: theme };
+        }
+        if (hint === 'qr') {
+            return { kind: 'qr', label: '快速回复', payload: pickQuickReplyList(parsed) || [] };
+        }
+        if (hint === 'regex') {
+            const scripts = pickRegexScripts(parsed);
+            return scripts ? { kind: 'regex', label: '正则', payload: scripts } : { kind: 'unsupported', label: '脚本' };
+        }
+
+        const book = worldbookPayload(bytes);
+        if (book) return { kind: 'worldbook', label: '世界书', payload: book };
         if (looksLikeCharacterCard(parsed)) return null;
 
         if (isPlainJsScript(parsed)) return { kind: 'unsupported', label: '脚本' };
@@ -829,17 +866,22 @@
         const qrList = pickQuickReplyList(parsed);
         if (qrList) return { kind: 'qr', label: '快速回复', payload: qrList };
 
-        return null;
+        return { kind: 'unknown', label: '' };
     }
 
     /** MIU 的「脚本」卡里也有普通 JS 脚本（酒馆助手那种），酒馆核心没有它的导入接口。 */
+    /** MIU 的「脚本」卡里也有普通 JS 脚本（酒馆助手那种），酒馆核心没有它的导入接口。 */
     function isPlainJsScript(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-        const inner = value.data && typeof value.data === 'object' && !Array.isArray(value.data) ? value.data : value;
-        if (inner.type !== 'script' && inner.type !== 'tool') return false;
-        return typeof inner.content === 'string' || typeof inner.script === 'string' || typeof inner.code === 'string';
+        const candidates = [value, value.data];
+        for (let i = 0; i < candidates.length; i++) {
+            const inner = candidates[i];
+            if (!inner || typeof inner !== 'object' || Array.isArray(inner)) continue;
+            if (inner.type !== 'script' && inner.type !== 'tool') continue;
+            if (typeof inner.content === 'string' || typeof inner.script === 'string' || typeof inner.code === 'string') return true;
+        }
+        return false;
     }
-
     function isRegexScript(value) {
         return !!value && typeof value === 'object' && !Array.isArray(value) &&
             (value.findRegex !== undefined || value.find_regex !== undefined ||
@@ -904,10 +946,11 @@
 
     function stripExtension(name) {
         const value = String(name || '').trim();
-        const stripped = value.replace(/\.[^./\\]+$/, '');
+        const stripped = value
+            .replace(/\.(worldbook|preset|theme|qr|regex|script)\.json$/i, '')
+            .replace(/\.[^./\\]+$/, '');
         return stripped || value || 'miu_tool';
     }
-
     async function postJsonToTavern(path, payload, errorCode) {
         const headers = await requestHeaders();
         headers['Content-Type'] = 'application/json';
@@ -1020,13 +1063,15 @@
             const fileName = cardFileName(meta.name);
             try {
                 const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
-                const kind = /\.json$/i.test(fileName) ? sniffJsonPayload(bytes) : null;
+                const hint = /\.json$/i.test(fileName) ? hintFromFileName(fileName) : null;
+                const kind = /\.json$/i.test(fileName) ? sniffJsonPayload(bytes, hint) : null;
                 if (kind && kind.kind === 'worldbook') await importWorldbookToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'preset') await importPresetToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'theme') await importThemeToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'qr') await importQuickReplyToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'regex') await importRegexToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'unsupported') throw new Error('unsupported_script');
+                else if (kind && kind.kind === 'unknown') throw new Error('unknown_json');
                 else await importCardToTavern(fileName, bytes);
                 await callTool('miu_outbox_ack', { id: meta.id });
                 done++;
