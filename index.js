@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 工具推送版3';
+    const BUILD_TAG = '10-19 拉取分类版1';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -65,8 +65,12 @@
         callMode: null,
         /** 正在处理 MIU 的拉取请求，避免轮询重复触发。 */
         pullBusy: false,
-        /** 最近一次拿到的酒馆角色列表，用来给拉取的卡补名字。 */
+        /** 最近一次拿到的酒馆列表，用来给拉取的项补名字。 */
         catalog: [],
+        /** 工具类拉取用的正文缓存：id -> { kind, name, apiId, payload }。 */
+        toolData: new Map(),
+        /** 工具目录最近刷新时间。 */
+        toolDataAt: 0,
     };
 
     let settingsModule = null;
@@ -408,6 +412,8 @@
         return characters
             .filter(character => character && typeof character.avatar === 'string' && character.avatar)
             .map(character => ({
+                id: character.avatar,
+                kind: 'character',
                 avatar: character.avatar,
                 name: String(character.name || '角色卡').slice(0, 120),
             }));
@@ -437,9 +443,159 @@
         return remote
             .filter(character => character && typeof character.avatar === 'string' && character.avatar)
             .map(character => ({
+                id: character.avatar,
+                kind: 'character',
                 avatar: character.avatar,
                 name: String(character.name || '角色卡').slice(0, 120),
             }));
+    }
+
+    /** 酒馆的设置/预设/主题/快速回复目录（一次拿全，列表只发名字）。 */
+    async function postTavernJson(path, body) {
+        const headers = await requestHeaders();
+        headers['Content-Type'] = 'application/json';
+        const response = await fetch(path, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(body || {}),
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('catalog_failed');
+        return response.json();
+    }
+
+    function parseSettingsObject(data) {
+        if (data && data.settings && typeof data.settings === 'string') {
+            try { return JSON.parse(data.settings); } catch (error) { return {}; }
+        }
+        return (data && typeof data.settings === 'object' && data.settings) ? data.settings : {};
+    }
+
+    function toolEntriesFromSettings(data) {
+        const entries = [];
+        const dataMap = new Map();
+        const add = (id, kind, name, payload, apiId, sub) => {
+            const item = { id: id, kind: kind, name: String(name || kind).slice(0, 160), apiId: apiId || '', sub: sub || '' };
+            entries.push(item);
+            dataMap.set(id, { id: id, kind: kind, name: item.name, apiId: apiId || '', sub: sub || '', payload: payload });
+        };
+
+        const worlds = Array.isArray(data && data.world_names) ? data.world_names : [];
+        worlds.forEach((name, index) => {
+            const clean = String(name || '').trim();
+            if (!clean) return;
+            add('wb:' + index + ':' + clean, 'worldbook', clean, null, '', '');
+        });
+
+        const presetGroups = [
+            { contents: data && data.openai_settings, names: data && data.openai_setting_names, apiId: 'openai' },
+            { contents: data && data.textgenerationwebui_presets, names: data && data.textgenerationwebui_preset_names, apiId: 'textgenerationwebui' },
+            { contents: data && data.koboldai_settings, names: data && data.koboldai_setting_names, apiId: 'kobold' },
+            { contents: data && data.novelai_settings, names: data && data.novelai_setting_names, apiId: 'novel' },
+        ];
+        presetGroups.forEach(group => {
+            if (!Array.isArray(group.contents)) return;
+            group.contents.forEach((preset, index) => {
+                if (!preset || typeof preset !== 'object') return;
+                const rawName = (Array.isArray(group.names) && group.names[index]) || preset.name || ('预设 ' + (index + 1));
+                const name = String(rawName).slice(0, 160);
+                add('preset:' + group.apiId + ':' + index + ':' + name, 'preset', name, preset, group.apiId, '');
+            });
+        });
+
+        const themes = Array.isArray(data && data.themes) ? data.themes : [];
+        themes.forEach((theme, index) => {
+            if (!theme || typeof theme !== 'object') return;
+            const name = String(theme.name || theme.theme_name || ('美化 ' + (index + 1))).slice(0, 160);
+            add('theme:' + index + ':' + name, 'theme', name, theme, '', '');
+        });
+
+        const quickReplies = Array.isArray(data && data.quickReplyPresets) ? data.quickReplyPresets : [];
+        quickReplies.forEach((set, index) => {
+            if (!set || typeof set !== 'object') return;
+            const name = String(set.name || set.displayName || ('快速回复 ' + (index + 1))).slice(0, 160);
+            add('qr:' + index + ':' + name, 'qr', name, set, '', '');
+        });
+
+        const settings = parseSettingsObject(data);
+        const regex = settings && settings.extension_settings && Array.isArray(settings.extension_settings.regex)
+            ? settings.extension_settings.regex : [];
+        regex.forEach((script, index) => {
+            if (!script || typeof script !== 'object') return;
+            const name = String(script.scriptName || script.name || ('正则 ' + (index + 1))).slice(0, 160);
+            add('regex:' + index + ':' + name, 'regex', name, script, '', '');
+        });
+
+        return { entries: entries, dataMap: dataMap };
+    }
+
+    /** 拉取列表时把工具目录也带上；正文先放在内存里，选中后才发。 */
+    async function loadToolCatalog(force) {
+        const fresh = state.toolDataAt > 0 && (Date.now() - state.toolDataAt) < 5 * 60 * 1000;
+        if (!force && fresh) return Array.from(state.toolData.values()).map(item => ({
+            id: item.id,
+            kind: item.kind,
+            name: item.name,
+            apiId: item.apiId,
+            sub: item.sub,
+        }));
+        const data = await postTavernJson('/api/settings/get', {});
+        const parsed = toolEntriesFromSettings(data || {});
+        state.toolData = parsed.dataMap;
+        state.toolDataAt = Date.now();
+        return parsed.entries;
+    }
+
+    /** 从列表 id 里还原名字（扩展重载后 state 丢了也能用）。 */
+    function toolNameFromId(id) {
+        const parts = String(id || '').split(':');
+        if (parts[0] === 'preset') return parts.slice(3).join(':');
+        return parts.slice(2).join(':');
+    }
+
+    function toolFileName(name, kind) {
+        const base = String(name || 'miu_tool').replace(/[\\/:*?"<>|]/g, '_').trim() || 'miu_tool';
+        const suffix = '.' + kind + '.json';
+        const lower = base.toLowerCase();
+        return lower.endsWith(suffix) ? base : base.replace(/\.json$/i, '') + suffix;
+    }
+
+    /** 取一项工具的正文；世界书按名字现取，其它用目录里的对象。 */
+    async function resolveToolPayload(id, info) {
+        let tool = state.toolData.get(id);
+        if (!tool) {
+            await loadToolCatalog(true);
+            tool = state.toolData.get(id);
+        }
+        if (!tool) throw new Error('unknown_card');
+        if (tool.kind === 'worldbook') {
+            const name = tool.name || toolNameFromId(id);
+            const body = await postTavernJson('/api/worldinfo/get', { name: name });
+            return body;
+        }
+        return tool.payload;
+    }
+
+    async function pushBytes(name, bytes, thumb) {
+        const begin = await callTool('miu_push_begin', {
+            name: name,
+            bytes: bytes.length,
+            thumb: thumb || '',
+        });
+        const operationId = begin && begin.operationId;
+        if (!operationId) throw new Error('bridge_bad_response');
+        try {
+            const total = Math.ceil(bytes.length / CHUNK_BYTES);
+            for (let index = 0; index < total; index++) {
+                const slice = bytes.subarray(index * CHUNK_BYTES, Math.min((index + 1) * CHUNK_BYTES, bytes.length));
+                await callTool('miu_push_chunk', { operationId: operationId, index: index, data: bytesToBase64(slice) });
+                if (total > 1) setStatus('正在推送 ' + name + '：' + (index + 1) + ' / ' + total + ' 片');
+            }
+            return await callTool('miu_push_end', { operationId: operationId });
+        } catch (error) {
+            try { await callTool('miu_push_abort', { operationId: operationId }); } catch (ignore) { /* 放弃失败也无所谓 */ }
+            throw error;
+        }
     }
 
     function currentCharacter() {
@@ -1102,67 +1258,99 @@
     // MIU 主动拉取（MIU 里挑酒馆的卡）
     // ------------------------------------------------------------------
 
-    /** MIU 要角色列表：把酒馆的卡列表送过去，让它显示出来给用户勾选。 */
+    /** MIU 要列表：角色卡 + 世界书 / 预设 / 美化 / 快速回复 / 正则，只发名字和类型。 */
     async function sendCatalogToMiu() {
         try {
             const list = await listCharacters();
-            state.catalog = list;
-            await callTool('miu_pull_list', { json: JSON.stringify(list) });
-            setStatus('已把酒馆里的 ' + list.length + ' 张角色卡发给 MIU，去 MIU 里勾选要拉哪几张。', 'ok');
-            log('已把 ' + list.length + ' 张角色卡发给 MIU。');
+            let tools = [];
+            try {
+                tools = await loadToolCatalog(false);
+            } catch (error) {
+                log('工具目录读取失败（角色卡不受影响）：' + describe(error));
+            }
+            const merged = list.concat(tools);
+            state.catalog = merged;
+            await callTool('miu_pull_list', { json: JSON.stringify(merged) });
+            setStatus('已把酒馆里的 ' + merged.length + ' 项发给 MIU，去 MIU 里分类勾选。', 'ok');
+            log('已把 ' + list.length + ' 张角色卡和 ' + tools.length + ' 项工具发给 MIU。');
         } catch (error) {
             const reason = describe(error);
-            log('读取角色列表失败：' + reason);
+            log('读取拉取列表失败：' + reason);
             try { await callTool('miu_pull_error', { message: reason }); } catch (ignore) { /* 报不上去也只是少条提示 */ }
         }
     }
 
-    /** MIU 勾好之后：逐张导出 PNG 推进 MIU 的待接收队列，最后把新卡 id 回报过去。 */
+    function kindFromId(id) {
+        const prefix = String(id || '').split(':')[0];
+        if (prefix === 'wb') return 'worldbook';
+        if (prefix === 'preset') return 'preset';
+        if (prefix === 'theme') return 'theme';
+        if (prefix === 'qr') return 'qr';
+        if (prefix === 'regex') return 'regex';
+        return 'character';
+    }
+
+    /** MIU 勾好之后：角色卡导出 PNG，工具导出 JSON，推进待接收队列后回报新 id。 */
     async function pullForMiu(picks) {
-        const named = new Map((state.catalog || []).map(item => [item.avatar, item.name]));
+        const named = new Map((state.catalog || []).map(item => [item.id, item]));
         const ids = [];
         let done = 0;
         let failed = 0;
 
         for (let index = 0; index < picks.length; index++) {
-            const avatar = picks[index];
-            const name = cardFileName(named.get(avatar) || avatar);
+            const id = picks[index];
+            const info = named.get(id);
+            const kind = (info && info.kind) || kindFromId(id);
+            let name = '';
             try {
-                const result = await pushOne({ avatar, name }, '「' + name + '」');
+                let result = null;
+                if (kind === 'character') {
+                    const avatar = (info && info.avatar) || id;
+                    name = cardFileName((info && info.name) || avatar);
+                    result = await pushOne({ avatar: avatar, name: name }, '「' + name + '」');
+                } else {
+                    const plainName = (info && info.name) || toolNameFromId(id) || kind;
+                    name = toolFileName(plainName, kind);
+                    const payload = await resolveToolPayload(id, info);
+                    if (!payload) throw new Error('unknown_card');
+                    const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
+                    if (bytes.length > MAX_CARD_BYTES) throw new Error('size_limit');
+                    result = await pushBytes(name, bytes, '');
+                }
                 if (result && typeof result.id === 'string' && result.id) ids.push(result.id);
                 done++;
                 log('已拉到 MIU：' + name);
             } catch (error) {
                 failed++;
-                log('拉取失败：' + name + '（' + describe(error) + '）');
+                log('拉取失败：' + (name || id) + '（' + describe(error) + '）');
             }
 
-            setStatus('正在给 MIU 拉卡… ' + (index + 1) + ' / ' + picks.length);
+            setStatus('正在给 MIU 拉取… ' + (index + 1) + ' / ' + picks.length);
             try {
-                await callTool('miu_pull_report', { done, failed, total: picks.length, final: false });
+                await callTool('miu_pull_report', { done: done, failed: failed, total: picks.length, final: false });
             } catch (error) { /* 进度报不上去不影响继续拉 */ }
             await new Promise(resolve => setTimeout(resolve, 0));
         }
 
         try {
             await callTool('miu_pull_report', {
-                done,
-                failed,
+                done: done,
+                failed: failed,
                 total: picks.length,
                 final: true,
-                ids,
+                ids: ids,
                 message: failed > 0
-                    ? ('拉了 ' + done + ' 张，失败 ' + failed + ' 张。')
-                    : ('已把 ' + done + ' 张卡拉到 MIU。'),
+                    ? ('拉了 ' + done + ' 项，失败 ' + failed + ' 项。')
+                    : ('已把 ' + done + ' 项拉到 MIU。'),
             });
         } catch (error) {
             log('回报拉取结果失败：' + describe(error));
         }
 
         if (failed > 0) {
-            setStatus('拉取结束：成功 ' + done + ' 张，失败 ' + failed + ' 张（失败的那几张 MIU 里没有）。', 'error');
+            setStatus('拉取结束：成功 ' + done + ' 项，失败 ' + failed + ' 项（失败的那些 MIU 里没有）。', 'error');
         } else {
-            setStatus('拉取结束：' + done + ' 张已送进 MIU，切回 MIU 会自动入库。', 'ok');
+            setStatus('拉取结束：' + done + ' 项已送进 MIU，切回 MIU 会自动入库。', 'ok');
         }
     }
 
