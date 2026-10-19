@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 世界书支持版';
+    const BUILD_TAG = '10-19 工具推送版';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -49,6 +49,11 @@
         select_character: '请先在 TT 里选中一张角色卡。',
         import_failed: '酒馆拒绝了这次导入（这张卡可能已经存在，或格式不对）。',
         unknown_card: '这张卡在 MIU 里已经不在待发送列表了。',
+        preset_import_failed: '酒馆拒绝了这个预设（数据可能不是预设格式）。',
+        theme_import_failed: '酒馆拒绝了这个美化主题。',
+        qr_import_failed: '酒馆拒绝了这个快速回复集合。',
+        regex_import_failed: '写不进正则：这里不是酒馆页面内部。',
+        unsupported_script: '这份「脚本」不是酒馆正则（酒馆助手那种 JS 脚本没有导入接口），没推过去，还留在 MIU 队列里。',
     };
 
     const state = {
@@ -163,7 +168,7 @@
           <li>点「推送当前角色」或「推送全部角色卡」，等进度跑完。</li>
           <li>切回 MIU → 设置 → TauriTavern → 点「选择要导入的卡」，勾选后导入。</li>
         </ol>
-        <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点纸飞机「发送到酒馆」，在弹出的选项里选「发送到酒馆（TT 联动）」，卡就会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 3 秒自动刷新）。</p>
+        <p><b>反向（MIU → 酒馆）</b>：在 MIU 里进角色卡详情页点纸飞机「发送到酒馆」，在弹出的选项里选「发送到酒馆（TT 联动）」，卡就会排进 MIU 的「待发送到酒馆」；回到这里点「接收 MIU 推送」导入酒馆。按钮上的数字就是 MIU 里排队的张数（每 3 秒自动刷新）。角色卡 / 世界书 / 预设 / 美化 / 快速回复都能这样推；正则也走这条路，但只在 TT 里有效（酒馆没开出导入接口）。</p>
         <p><b>MIU 主动拉取（酒馆 → MIU）</b>：在 MIU 里点「拉取 TauriTavern」，勾选想拉进来的卡，这边会自动把卡送过去，本页不用点任何按钮。拉的时候 TT 保持运行（挂小窗最稳）。</p>
         <p>连不上时：先确认 MIU 的接收服务开着；再确认 MIU 没有被系统冻结（可以分屏或锁定后台）。安卓切后台会冻结 App，所以推完请尽快切回 MIU 导入。</p>
       </details>
@@ -734,12 +739,7 @@
             return null;
         }
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-        // 角色卡的标志：spec 信封，或者卡字段（哪怕值是空字符串也算，用「有没有这个键」判断）
-        const cardFields = ['spec', 'first_mes', 'mes_example', 'personality', 'scenario', 'system_prompt', 'post_history_instructions'];
-        for (let i = 0; i < cardFields.length; i++) {
-            if (Object.prototype.hasOwnProperty.call(parsed, cardFields[i])) return null;
-            if (parsed.data && Object.prototype.hasOwnProperty.call(parsed.data, cardFields[i])) return null;
-        }
+        if (looksLikeCharacterCard(parsed)) return null;
 
         const found = findWorldbookEntries(parsed, 0);
         if (!found) return null;
@@ -791,6 +791,182 @@
         return true;
     }
 
+    /** 角色卡的标志：spec 信封，或者卡字段（哪怕值是空字符串也算，用「有没有这个键」判断）。 */
+    function looksLikeCharacterCard(parsed) {
+        const cardFields = ['spec', 'first_mes', 'mes_example', 'personality', 'scenario', 'system_prompt', 'post_history_instructions'];
+        for (let i = 0; i < cardFields.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(parsed, cardFields[i])) return true;
+            if (parsed.data && Object.prototype.hasOwnProperty.call(parsed.data, cardFields[i])) return true;
+        }
+        return false;
+    }
+
+    /** 队列里的字节属于哪一类数据；认不出来就返回 null（当角色卡处理）。 */
+    function sniffJsonPayload(bytes) {
+        const book = worldbookPayload(bytes);
+        if (book) return { kind: 'worldbook', label: '世界书', payload: book };
+
+        let parsed = null;
+        try {
+            parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+        } catch (ignore) {
+            return null;
+        }
+        if (!parsed || typeof parsed !== 'object') return null;
+        if (looksLikeCharacterCard(parsed)) return null;
+
+        if (isPlainJsScript(parsed)) return { kind: 'unsupported', label: '脚本' };
+
+        const scripts = pickRegexScripts(parsed);
+        if (scripts) return { kind: 'regex', label: '正则', payload: scripts };
+
+        const preset = pickPresetPayload(parsed);
+        if (preset) return { kind: 'preset', label: '预设', payload: preset };
+
+        const theme = pickThemePayload(parsed);
+        if (theme) return { kind: 'theme', label: '美化', payload: theme };
+
+        const qrList = pickQuickReplyList(parsed);
+        if (qrList) return { kind: 'qr', label: '快速回复', payload: qrList };
+
+        return null;
+    }
+
+    /** MIU 的「脚本」卡里也有普通 JS 脚本（酒馆助手那种），酒馆核心没有它的导入接口。 */
+    function isPlainJsScript(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        const inner = value.data && typeof value.data === 'object' && !Array.isArray(value.data) ? value.data : value;
+        if (inner.type !== 'script' && inner.type !== 'tool') return false;
+        return typeof inner.content === 'string' || typeof inner.script === 'string' || typeof inner.code === 'string';
+    }
+
+    function isRegexScript(value) {
+        return !!value && typeof value === 'object' && !Array.isArray(value) &&
+            (value.findRegex !== undefined || value.find_regex !== undefined ||
+                value.replaceString !== undefined || value.replace_with !== undefined);
+    }
+
+    /** 从脚本数据里挑出酒馆正则；挑不到说明它只是普通 JS 脚本。 */
+    function pickRegexScripts(value) {
+        const containers = [value, value.regex, value.scripts, value.regex_scripts,
+            value.data && value.data.regex, value.data && value.data.regex_scripts];
+        for (let i = 0; i < containers.length; i++) {
+            const item = containers[i];
+            if (Array.isArray(item)) {
+                const hits = item.filter(isRegexScript);
+                if (hits.length > 0) return hits;
+            } else if (isRegexScript(item)) {
+                return [item];
+            }
+        }
+        return null;
+    }
+
+    /** 预设按 apiId 分目录存，酒馆的保存接口必须带这个 apiId，这里按内容猜一个。 */
+    function guessPresetApiId(preset) {
+        if (Array.isArray(preset.prompts) && preset.prompts.length > 0) return 'openai';
+        if (Array.isArray(preset.prompt_order)) return 'openai';
+        if (typeof preset.temp === 'number' || typeof preset.rep_pen === 'number' || typeof preset.top_k === 'number') return 'textgenerationwebui';
+        if (typeof preset.temperature === 'number' && typeof preset.max_length === 'number') return 'novel';
+        if (preset.input_sequence !== undefined || preset.output_sequence !== undefined) return 'instruct';
+        if (typeof preset.content === 'string') return 'sysprompt';
+        return 'openai';
+    }
+
+    function pickPresetPayload(value) {
+        const inner = value.preset && typeof value.preset === 'object' && !Array.isArray(value.preset) ? value.preset : value;
+        const hasPrompts = Array.isArray(inner.prompts) && inner.prompts.length > 0;
+        const hasOrder = Array.isArray(inner.prompt_order);
+        const hasSampler = typeof inner.temp === 'number' || typeof inner.rep_pen === 'number' || typeof inner.top_k === 'number';
+        const hasOpenAiSampler = typeof inner.temperature === 'number' && typeof inner.top_p === 'number' && typeof inner.openai_max_tokens === 'number';
+        if (!hasPrompts && !hasOrder && !hasSampler && !hasOpenAiSampler) return null;
+        return { apiId: guessPresetApiId(inner), preset: inner };
+    }
+
+    function pickThemePayload(value) {
+        const inner = value.theme && typeof value.theme === 'object' && !Array.isArray(value.theme) ? value.theme : value;
+        const hit = inner.blur_strength !== undefined || inner.main_text_color !== undefined ||
+            inner.chat_display !== undefined || inner.theme_name !== undefined || inner.chat_width !== undefined;
+        return hit ? inner : null;
+    }
+
+    function pickQuickReplyList(value) {
+        if (Array.isArray(value)) {
+            const first = value[0];
+            return first && (first.label !== undefined || first.message !== undefined) ? value : null;
+        }
+        const inner = value.set && typeof value.set === 'object' && !Array.isArray(value.set) ? value.set : value;
+        if (Array.isArray(inner.qrList)) return inner.qrList;
+        if (Array.isArray(value.quick_replies)) return value.quick_replies;
+        if (inner.label !== undefined || inner.message !== undefined) return [inner];
+        return null;
+    }
+
+    function stripExtension(name) {
+        const value = String(name || '').trim();
+        const stripped = value.replace(/\.[^./\\]+$/, '');
+        return stripped || value || 'miu_tool';
+    }
+
+    async function postJsonToTavern(path, payload, errorCode) {
+        const headers = await requestHeaders();
+        headers['Content-Type'] = 'application/json';
+        const response = await fetch(path, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(errorCode || 'import_failed');
+        return true;
+    }
+
+    async function importPresetToTavern(fileName, info) {
+        return postJsonToTavern('/api/presets/save', {
+            name: stripExtension(fileName),
+            apiId: info.apiId,
+            preset: info.preset,
+        }, 'preset_import_failed');
+    }
+
+    async function importThemeToTavern(fileName, theme) {
+        return postJsonToTavern('/api/themes/save', Object.assign({}, theme, { name: stripExtension(fileName) }), 'theme_import_failed');
+    }
+
+    async function importQuickReplyToTavern(fileName, list) {
+        return postJsonToTavern('/api/quick-replies/save', {
+            version: 2,
+            name: stripExtension(fileName),
+            disableSend: false,
+            placeBeforeInput: false,
+            injectInput: false,
+            color: 'transparent',
+            onlyBorderColor: false,
+            idIndex: list.length,
+            qrList: list,
+        }, 'qr_import_failed');
+    }
+
+    /**
+     * 正则：酒馆没有单条导入的接口，只能在酒馆页面里直接改 extension_settings.regex 再触发保存，
+     * 所以这条路只在 TT（或本机酒馆）里有效。
+     */
+    async function importRegexToTavern(fileName, scripts) {
+        const module = await import('../../../extensions.js');
+        const settings = module.extension_settings;
+        if (!settings || typeof settings !== 'object') throw new Error('regex_import_failed');
+        const current = Array.isArray(settings.regex) ? settings.regex.slice() : [];
+        const keyOf = (script) => String((script && (script.id || script.findRegex || script.find_regex)) || '').trim();
+        for (const script of scripts) {
+            const key = keyOf(script);
+            const index = key ? current.findIndex((item) => keyOf(item) === key) : -1;
+            if (index >= 0) current[index] = script;
+            else current.push(script);
+        }
+        settings.regex = current;
+        await saveSettings();
+        return true;
+    }
     /** 分片取回 MIU 里的一张待发送卡。 */
     async function fetchOutboxCard(meta, label) {
         const total = Math.max(1, Math.ceil(Number(meta.bytes) / CHUNK_BYTES));
@@ -844,12 +1020,17 @@
             const fileName = cardFileName(meta.name);
             try {
                 const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
-                const book = /\.json$/i.test(fileName) ? worldbookPayload(bytes) : null;
-                if (book) await importWorldbookToTavern(fileName, book);
+                const kind = /\.json$/i.test(fileName) ? sniffJsonPayload(bytes) : null;
+                if (kind && kind.kind === 'worldbook') await importWorldbookToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'preset') await importPresetToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'theme') await importThemeToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'qr') await importQuickReplyToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'regex') await importRegexToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'unsupported') throw new Error('unsupported_script');
                 else await importCardToTavern(fileName, bytes);
                 await callTool('miu_outbox_ack', { id: meta.id });
                 done++;
-                log('已导入酒馆：' + fileName + '（' + (book ? '世界书，' : '') + bytes.length + ' 字节）');
+                log('已导入酒馆：' + fileName + '（' + (kind ? kind.label + '，' : '') + bytes.length + ' 字节）');
             } catch (error) {
                 failed++;
                 log('导入失败：' + fileName + '（' + describe(error) + '）');
