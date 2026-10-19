@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 TT工具拉取修复';
+    const BUILD_TAG = '10-19 TT分类按需拉取';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -28,6 +28,16 @@
     const THUMB_TIMEOUT_MS = 5000;
     /** 一轮轮询最多渲染几张，别把轮询占太久。 */
     const THUMB_PER_ROUND = 12;
+    /** MIU 拉取支持哪几类（和 MIU 界面上的分类一致）。 */
+    const PULL_KINDS = ['character', 'worldbook', 'preset', 'theme', 'qr', 'regex'];
+    const PULL_KIND_LABEL = {
+        character: '角色卡',
+        worldbook: '世界书',
+        preset: '预设',
+        theme: '美化',
+        qr: '快速回复',
+        regex: '正则',
+    };
     const TOOL_NAMES = [
         'miu_ping', 'miu_status', 'miu_push_begin',
         'miu_push_chunk', 'miu_push_end', 'miu_push_abort', 'miu_list_pending',
@@ -1345,20 +1355,36 @@
     // MIU 主动拉取（MIU 里挑酒馆的卡）
     // ------------------------------------------------------------------
 
-    /** MIU 要列表：角色卡 + 世界书 / 预设 / 美化 / 快速回复 / 正则，只发名字和类型。 */
-    async function sendCatalogToMiu() {
+    /** 把（可能的）一部分目录记进内存：跨分类勾选时还能按 id 找回名字。 */
+    function rememberCatalog(items) {
+        const byId = new Map((state.catalog || []).map(item => [item.id, item]));
+        (items || []).forEach(item => byId.set(item.id, item));
+        state.catalog = Array.from(byId.values());
+    }
+
+    /**
+     * MIU 要列表：MIU 点哪一类就只取哪一类（点角色卡不碰设置接口，点工具才读设置目录）。
+     * 老版本 MIU 不带分类，这里就当「全都要」，行为跟以前一样。
+     */
+    async function sendCatalogToMiu(kind) {
+        const want = PULL_KINDS.indexOf(String(kind || '')) >= 0 ? String(kind) : '';
         try {
-            const list = await listCharacters();
+            let list = [];
+            if (!want || want === 'character') list = await listCharacters();
             let tools = [];
-            try {
-                tools = await loadToolCatalog(false);
-            } catch (error) {
-                log('工具目录读取失败（角色卡不受影响）：' + describe(error));
+            if (!want || want !== 'character') {
+                try {
+                    tools = await loadToolCatalog(false);
+                } catch (error) {
+                    log('工具目录读取失败（角色卡不受影响）：' + describe(error));
+                }
+                if (want) tools = tools.filter(item => item.kind === want);
             }
             const merged = list.concat(tools);
-            state.catalog = merged;
+            rememberCatalog(merged);
             await callTool('miu_pull_list', { json: JSON.stringify(merged) });
-            setStatus('已把酒馆里的 ' + merged.length + ' 项发给 MIU，去 MIU 里分类勾选。', 'ok');
+            const label = PULL_KIND_LABEL[want] || '';
+            setStatus('已把酒馆里的 ' + merged.length + ' 项' + (label ? '（' + label + '）' : '') + '发给 MIU，去 MIU 里勾选。', 'ok');
             log('已把 ' + list.length + ' 张角色卡和 ' + tools.length + ' 项工具发给 MIU。');
         } catch (error) {
             const reason = describe(error);
@@ -1445,7 +1471,7 @@
     async function handlePullRequests() {
         const task = await callTool('miu_pull_state', {});
         if (task && task.listWanted) {
-            await sendCatalogToMiu();
+            await sendCatalogToMiu(task.wantKind);
             return true;
         }
         const picks = (task && Array.isArray(task.picks)) ? task.picks : [];
