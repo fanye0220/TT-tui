@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 拉取分类版1';
+    const BUILD_TAG = '10-19 TT工具拉取修复';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -471,57 +471,139 @@
         return (data && typeof data.settings === 'object' && data.settings) ? data.settings : {};
     }
 
+    function asObject(value) {
+        if (typeof value === 'string') {
+            try {
+                const parsed = JSON.parse(value);
+                return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null;
+            } catch (error) { return null; }
+        }
+        return (value && typeof value === 'object' && !Array.isArray(value)) ? value : null;
+    }
+
+    function asArray(value) {
+        if (Array.isArray(value)) return value;
+        if (typeof value === 'string') {
+            try {
+                const parsed = JSON.parse(value);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (error) { return []; }
+        }
+        return [];
+    }
+
+    /** 设置接口和酒馆页面内存合并取数：TT 的接口偶尔不给工具目录，页面里其实有。 */
+    function betterArray(primary, fallback) {
+        const p = asArray(primary);
+        const f = asArray(fallback);
+        return p.length > 0 ? p : f;
+    }
+
+    function mergedToolSource(data) {
+        const api = asObject(data) || {};
+        const nested = asObject(api.settings) || {};
+        const context = contextApi() || {};
+        const source = Object.assign({}, context, api, nested);
+        const extensionSettings = asObject(api.extension_settings)
+            || asObject(nested.extension_settings)
+            || asObject(context.extensionSettings)
+            || asObject(context.extension_settings)
+            || {};
+        source.extension_settings = extensionSettings;
+        source.settings = Object.keys(nested).length > 0 ? nested : (asObject(api.settings) || {});
+        source.world_names = betterArray(source.world_names, context.world_names);
+        source.openai_settings = betterArray(source.openai_settings, context.openai_settings);
+        source.openai_setting_names = betterArray(source.openai_setting_names, context.openai_setting_names);
+        source.textgenerationwebui_presets = betterArray(source.textgenerationwebui_presets, context.textgenerationwebui_presets);
+        source.textgenerationwebui_preset_names = betterArray(source.textgenerationwebui_preset_names, context.textgenerationwebui_preset_names);
+        source.koboldai_settings = betterArray(source.koboldai_settings, context.koboldai_settings);
+        source.koboldai_setting_names = betterArray(source.koboldai_setting_names, context.koboldai_setting_names);
+        source.novelai_settings = betterArray(source.novelai_settings, context.novelai_settings);
+        source.novelai_setting_names = betterArray(source.novelai_setting_names, context.novelai_setting_names);
+        source.themes = betterArray(source.themes, context.themes);
+        source.quickReplyPresets = betterArray(source.quickReplyPresets, context.quickReplyPresets);
+        return source;
+    }
+
+    function normalizePresetApi(value) {
+        const api = String(value || '').toLowerCase();
+        if (api === 'koboldhorde') return 'kobold';
+        if (api === 'kobold') return 'kobold';
+        if (api === 'novel') return 'novel';
+        if (api === 'textgenerationwebui') return 'textgenerationwebui';
+        if (api === 'openai') return 'openai';
+        return '';
+    }
+
+    /** 真预设：必须有提示词/顺序，或采样参数；脚本类（type=script）一律不要。 */
+    function isRealPreset(preset) {
+        if (!preset || typeof preset !== 'object' || Array.isArray(preset)) return false;
+        const type = String(preset.type || '').toLowerCase();
+        if (type === 'script' || type === 'tool') return false;
+        if (Array.isArray(preset.prompts) || Array.isArray(preset.prompt_order) || Array.isArray(preset.promptOrder)) return true;
+        const samplers = ['temperature', 'top_p', 'top_k', 'temp', 'rep_pen', 'repetition_penalty', 'openai_max_tokens', 'max_tokens'];
+        return samplers.some(key => typeof preset[key] === 'number');
+    }
+
     function toolEntriesFromSettings(data) {
         const entries = [];
         const dataMap = new Map();
+        const source = mergedToolSource(data);
+        const settings = asObject(source.settings) || {};
+        const activeApi = normalizePresetApi(settings.main_api || source.main_api || settings.api_server || source.api_server || '');
         const add = (id, kind, name, payload, apiId, sub) => {
             const item = { id: id, kind: kind, name: String(name || kind).slice(0, 160), apiId: apiId || '', sub: sub || '' };
             entries.push(item);
             dataMap.set(id, { id: id, kind: kind, name: item.name, apiId: apiId || '', sub: sub || '', payload: payload });
         };
 
-        const worlds = Array.isArray(data && data.world_names) ? data.world_names : [];
-        worlds.forEach((name, index) => {
-            const clean = String(name || '').trim();
+        const worlds = asArray(source.world_names);
+        worlds.forEach((rawName, index) => {
+            const clean = String(rawName || '').trim();
             if (!clean) return;
             add('wb:' + index + ':' + clean, 'worldbook', clean, null, '', '');
         });
 
         const presetGroups = [
-            { contents: data && data.openai_settings, names: data && data.openai_setting_names, apiId: 'openai' },
-            { contents: data && data.textgenerationwebui_presets, names: data && data.textgenerationwebui_preset_names, apiId: 'textgenerationwebui' },
-            { contents: data && data.koboldai_settings, names: data && data.koboldai_setting_names, apiId: 'kobold' },
-            { contents: data && data.novelai_settings, names: data && data.novelai_setting_names, apiId: 'novel' },
+            { contents: asArray(source.openai_settings), names: asArray(source.openai_setting_names), apiId: 'openai' },
+            { contents: asArray(source.textgenerationwebui_presets), names: asArray(source.textgenerationwebui_preset_names), apiId: 'textgenerationwebui' },
+            { contents: asArray(source.koboldai_settings), names: asArray(source.koboldai_setting_names), apiId: 'kobold' },
+            { contents: asArray(source.novelai_settings), names: asArray(source.novelai_setting_names), apiId: 'novel' },
         ];
-        presetGroups.forEach(group => {
-            if (!Array.isArray(group.contents)) return;
-            group.contents.forEach((preset, index) => {
-                if (!preset || typeof preset !== 'object') return;
+        const selectedGroups = activeApi
+            ? presetGroups.filter(group => group.apiId === activeApi)
+            : presetGroups.filter(group => group.apiId === 'openai');
+        const groupsToRead = selectedGroups.length > 0 ? selectedGroups : presetGroups.filter(group => group.apiId === 'openai');
+        groupsToRead.forEach(group => {
+            group.contents.forEach((rawPreset, index) => {
+                const preset = asObject(rawPreset);
+                if (!preset || !isRealPreset(preset)) return;
                 const rawName = (Array.isArray(group.names) && group.names[index]) || preset.name || ('预设 ' + (index + 1));
                 const name = String(rawName).slice(0, 160);
                 add('preset:' + group.apiId + ':' + index + ':' + name, 'preset', name, preset, group.apiId, '');
             });
         });
 
-        const themes = Array.isArray(data && data.themes) ? data.themes : [];
-        themes.forEach((theme, index) => {
-            if (!theme || typeof theme !== 'object') return;
+        const themes = asArray(source.themes);
+        themes.forEach((rawTheme, index) => {
+            const theme = asObject(rawTheme);
+            if (!theme) return;
             const name = String(theme.name || theme.theme_name || ('美化 ' + (index + 1))).slice(0, 160);
             add('theme:' + index + ':' + name, 'theme', name, theme, '', '');
         });
 
-        const quickReplies = Array.isArray(data && data.quickReplyPresets) ? data.quickReplyPresets : [];
-        quickReplies.forEach((set, index) => {
-            if (!set || typeof set !== 'object') return;
+        const quickReplies = asArray(source.quickReplyPresets);
+        quickReplies.forEach((rawSet, index) => {
+            const set = asObject(rawSet);
+            if (!set) return;
             const name = String(set.name || set.displayName || ('快速回复 ' + (index + 1))).slice(0, 160);
             add('qr:' + index + ':' + name, 'qr', name, set, '', '');
         });
 
-        const settings = parseSettingsObject(data);
-        const regex = settings && settings.extension_settings && Array.isArray(settings.extension_settings.regex)
-            ? settings.extension_settings.regex : [];
-        regex.forEach((script, index) => {
-            if (!script || typeof script !== 'object') return;
+        const regex = asArray(source.extension_settings && source.extension_settings.regex);
+        regex.forEach((rawScript, index) => {
+            const script = asObject(rawScript);
+            if (!script) return;
             const name = String(script.scriptName || script.name || ('正则 ' + (index + 1))).slice(0, 160);
             add('regex:' + index + ':' + name, 'regex', name, script, '', '');
         });
@@ -539,7 +621,12 @@
             apiId: item.apiId,
             sub: item.sub,
         }));
-        const data = await postTavernJson('/api/settings/get', {});
+        let data = {};
+        try {
+            data = await postTavernJson('/api/settings/get', {});
+        } catch (error) {
+            log('设置接口没返回工具目录，改用酒馆页面内存读取：' + describe(error));
+        }
         const parsed = toolEntriesFromSettings(data || {});
         state.toolData = parsed.dataMap;
         state.toolDataAt = Date.now();
