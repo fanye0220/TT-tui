@@ -555,7 +555,7 @@
         return samplers.some(key => typeof preset[key] === 'number');
     }
 
-    function toolEntriesFromSettings(data) {
+    function toolEntriesFromSettings(data, keepPayloadFor) {
         const entries = [];
         const dataMap = new Map();
         const source = mergedToolSource(data);
@@ -564,7 +564,14 @@
         const add = (id, kind, name, payload, apiId, sub) => {
             const item = { id: id, kind: kind, name: String(name || kind).slice(0, 160), apiId: apiId || '', sub: sub || '' };
             entries.push(item);
-            dataMap.set(id, { id: id, kind: kind, name: item.name, apiId: apiId || '', sub: sub || '', payload: payload });
+            // 列表只存名字，不存 payload：预设/世界书正文可能几十 KB~几 MB，
+            // 全存进 dataMap 会让列表加载很慢（酒馆设置接口返回的 JSON 可能几十 MB）。
+            // 只有批量拉取点名要的那几项才把正文留在内存，取完就丢。
+            const entry = { id: id, kind: kind, name: item.name, apiId: apiId || '', sub: sub || '' };
+            if (payload !== undefined && payload !== null && (!keepPayloadFor || keepPayloadFor.has(id))) {
+                entry.payload = payload;
+            }
+            dataMap.set(id, entry);
         };
 
         const worlds = asArray(source.world_names);
@@ -657,19 +664,39 @@
         return lower.endsWith(suffix) ? base : base.replace(/\.json$/i, '') + suffix;
     }
 
-    /** 取一项工具的正文；世界书按名字现取，其它用目录里的对象。 */
+    /** 批量取工具正文：整批只读一次设置接口，取完只留这批的正文，其余仍只有名字。 */
+    async function loadToolPayloads(ids) {
+        const wanted = new Set(ids);
+        if (wanted.size === 0) return;
+        const missing = Array.from(wanted).filter(id => {
+            const tool = state.toolData.get(id);
+            return !tool || tool.payload === undefined;
+        });
+        if (missing.length === 0) return;
+        const data = await postTavernJson('/api/settings/get', {});
+        const parsed = toolEntriesFromSettings(data || {}, wanted);
+        const merged = new Map(state.toolData);
+        parsed.dataMap.forEach((entry, id) => {
+            if (wanted.has(id)) merged.set(id, entry);
+        });
+        state.toolData = merged;
+        state.toolDataAt = Date.now();
+        const stillMissing = missing.filter(id => {
+            const tool = merged.get(id);
+            return !tool || tool.payload === undefined;
+        });
+        if (stillMissing.length > 0) throw new Error('unknown_card');
+    }
+
+    /** 取一项工具的正文；世界书按名字现取，其它用已加载的正文。 */
     async function resolveToolPayload(id, info) {
-        let tool = state.toolData.get(id);
-        if (!tool) {
-            await loadToolCatalog(true);
-            tool = state.toolData.get(id);
+        const tool = state.toolData.get(id);
+        const name = (tool && tool.name) || (info && info.name) || toolNameFromId(id);
+        const kind = (tool && tool.kind) || (info && info.kind) || kindFromId(id);
+        if (kind === 'worldbook') {
+            return await postTavernJson('/api/worldinfo/get', { name: name });
         }
-        if (!tool) throw new Error('unknown_card');
-        if (tool.kind === 'worldbook') {
-            const name = tool.name || toolNameFromId(id);
-            const body = await postTavernJson('/api/worldinfo/get', { name: name });
-            return body;
-        }
+        if (!tool || tool.payload === undefined) throw new Error('unknown_card');
         return tool.payload;
     }
 
@@ -1409,6 +1436,16 @@
         const ids = [];
         let done = 0;
         let failed = 0;
+
+        const toolIds = picks.filter(id => {
+            const info = named.get(id);
+            const kind = (info && info.kind) || kindFromId(id);
+            return kind !== 'character' && kind !== 'worldbook';
+        });
+        if (toolIds.length > 0) {
+            setStatus('正在读取 ' + toolIds.length + ' 项工具正文…');
+            try { await loadToolPayloads(toolIds); } catch (error) { log('读取工具正文失败：' + describe(error)); }
+        }
 
         for (let index = 0; index < picks.length; index++) {
             const id = picks[index];
