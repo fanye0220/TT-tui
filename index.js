@@ -629,7 +629,27 @@
     }
 
     /** 拉取列表时把工具目录也带上；正文先放在内存里，选中后才发。 */
-    async function loadToolCatalog(force) {
+    async function loadToolCatalog(force, wantKind) {
+        // 如果只要世界书，酒馆前端内存直接有列表，像角色卡一样0延迟秒回，不碰沉重的设置接口
+        if (wantKind === 'worldbook') {
+            const context = contextApi() || {};
+            const names = asArray(context.world_names).length > 0
+                ? asArray(context.world_names)
+                : (typeof window !== 'undefined' ? asArray(window.world_names) : []);
+            if (names.length > 0) {
+                return names.map((rawName, index) => {
+                    const clean = String(rawName || '').trim();
+                    if (!clean) return null;
+                    return {
+                        id: 'wb:' + index + ':' + clean,
+                        kind: 'worldbook',
+                        name: clean,
+                        apiId: '',
+                        sub: '',
+                    };
+                }).filter(Boolean);
+            }
+        }
         const fresh = state.toolDataAt > 0 && (Date.now() - state.toolDataAt) < 5 * 60 * 1000;
         if (!force && fresh) return Array.from(state.toolData.values()).map(item => ({
             id: item.id,
@@ -1401,7 +1421,7 @@
             let tools = [];
             if (!want || want !== 'character') {
                 try {
-                    tools = await loadToolCatalog(false);
+                    tools = await loadToolCatalog(false, want);
                 } catch (error) {
                     log('工具目录读取失败（角色卡不受影响）：' + describe(error));
                 }
@@ -1463,7 +1483,7 @@
                     name = toolFileName(plainName, kind);
                     const payload = await resolveToolPayload(id, info);
                     if (!payload) throw new Error('unknown_card');
-                    const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
+                    const bytes = new TextEncoder().encode(JSON.stringify(payload));
                     if (bytes.length > MAX_CARD_BYTES) throw new Error('size_limit');
                     result = await pushBytes(name, bytes, '');
                 }
