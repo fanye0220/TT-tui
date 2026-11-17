@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '11-17 人设拉取';
+    const BUILD_TAG = '11-17 人设头像';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -562,13 +562,15 @@
         const source = mergedToolSource(data);
         const settings = asObject(source.settings) || {};
         const activeApi = normalizePresetApi(settings.main_api || source.main_api || settings.api_server || source.api_server || '');
-        const add = (id, kind, name, payload, apiId, sub) => {
+        const add = (id, kind, name, payload, apiId, sub, avatar) => {
             const item = { id: id, kind: kind, name: String(name || kind).slice(0, 160), apiId: apiId || '', sub: sub || '' };
+            if (avatar) item.avatar = avatar;
             entries.push(item);
             // 列表只存名字，不存 payload：预设/世界书正文可能几十 KB~几 MB，
             // 全存进 dataMap 会让列表加载很慢（酒馆设置接口返回的 JSON 可能几十 MB）。
             // 只有批量拉取点名要的那几项才把正文留在内存，取完就丢。
             const entry = { id: id, kind: kind, name: item.name, apiId: apiId || '', sub: sub || '' };
+            if (avatar) entry.avatar = avatar;
             if (payload !== undefined && payload !== null && (!keepPayloadFor || keepPayloadFor.has(id))) {
                 entry.payload = payload;
             }
@@ -651,7 +653,7 @@
                 content: descText,
                 active: isActive,
             };
-            add('persona:' + avatarKey, 'persona', name, payload, '', isActive ? '当前人设' : 'User 人设');
+            add('persona:' + avatarKey, 'persona', name, payload, '', isActive ? '当前人设' : 'User 人设', 'persona:' + avatarKey);
         });
 
         return { entries: entries, dataMap: dataMap };
@@ -686,6 +688,7 @@
             name: item.name,
             apiId: item.apiId,
             sub: item.sub,
+            avatar: item.avatar || '',
         }));
         let data = {};
         try {
@@ -754,8 +757,11 @@
         const key = String(avatarKey || '').trim();
         if (!key) return '';
         const urls = [
+            '/thumbnail?type=persona&file=' + encodeURIComponent(key),
             '/User Avatars/' + encodeURIComponent(key),
             '/user/avatars/' + encodeURIComponent(key),
+            '/api/avatars/get/' + encodeURIComponent(key),
+            '/thumbnail?type=user&file=' + encodeURIComponent(key),
         ];
         for (const url of urls) {
             try {
@@ -833,11 +839,22 @@
     /** 内存头像缩略图缓存：避免重复抓取或渲染同一个 avatar */
     const THUMB_CACHE = new Map();
 
-    /** 这张卡的头像地址候选：先问酒馆上下文，再按酒馆的缩略图和角色静态资源地址匹配。 */
-    function thumbUrlCandidates(avatar) {
+    /** 这张卡的头像地址候选：先问酒馆上下文，再按酒馆的缩略图和静态资源地址匹配。 */
+    function thumbUrlCandidates(avatar, persona) {
         const urls = [];
         const cleanName = String(avatar || '').replace(/^[\/\\]+/, '');
         const encoded = encodeURIComponent(cleanName);
+
+        // 人设图不是角色卡，走 User Avatars / persona 缩略图那套地址
+        if (persona) {
+            try {
+                urls.push('/thumbnail?type=persona&file=' + encoded);
+                urls.push('/thumbnail?type=user&file=' + encoded);
+                urls.push('/User Avatars/' + encoded);
+                urls.push('/user/avatars/' + encoded);
+                urls.push('/api/avatars/get/' + encoded);
+            } catch (error) {}
+        }
 
         const context = contextApi();
         if (context && typeof context.getThumbnailUrl === 'function') {
@@ -986,6 +1003,11 @@
      */
     async function renderThumb(avatar) {
         if (!avatar || typeof avatar !== 'string') return { data: '', reason: 'thumb_bad_avatar' };
+        // 人设条目 id 是 persona:文件名；缓存键保持完整 id（前端按这个取图），
+        // 真正取图时去掉前缀，否则会拿 persona:xxx.png 去酒馆里找一个不存在的文件。
+        const persona = avatar.indexOf('persona:') === 0;
+        const fileKey = persona ? avatar.slice('persona:'.length) : avatar;
+        if (!fileKey) return { data: '', reason: 'thumb_bad_avatar' };
         const cached = THUMB_CACHE.get(avatar);
         if (typeof cached === 'string' && cached) return { data: cached, reason: '' };
 
@@ -993,7 +1015,7 @@
 
         // 1. 酒馆页面上已经渲染好的那张头像
         try {
-            const domThumb = findDomThumb(avatar);
+            const domThumb = findDomThumb(fileKey);
             if (domThumb) {
                 THUMB_CACHE.set(avatar, domThumb);
                 return { data: domThumb, reason: '' };
@@ -1001,7 +1023,7 @@
         } catch (ignore) { /* 探测失败就往下走 */ }
 
         // 2. 候选地址逐个试
-        const candidates = thumbUrlCandidates(avatar);
+        const candidates = thumbUrlCandidates(fileKey, persona);
         let reason = candidates.length === 0 ? 'thumb_no_url' : 'thumb_fetch_failed';
         for (let index = 0; index < candidates.length; index++) {
             const left = deadline - Date.now();
@@ -1031,10 +1053,10 @@
             }
         }
 
-        // 3. 兜底：导出整卡 PNG，再从卡图里抽头像
-        if (deadline - Date.now() > 500) {
+        // 3. 兜底：导出整卡 PNG，再从卡图里抽头像（人设没有整卡，跳过）
+        if (!persona && deadline - Date.now() > 500) {
             try {
-                const cardBytes = await exportCard(avatar);
+                const cardBytes = await exportCard(fileKey);
                 if (cardBytes && cardBytes.length >= 8) {
                     const thumb = await renderBytesToThumb(cardBytes);
                     if (thumb) {
