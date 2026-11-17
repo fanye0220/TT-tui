@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '10-19 TT分类按需拉取';
+    const BUILD_TAG = '11-17 人设拉取';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -29,7 +29,7 @@
     /** 一轮轮询最多渲染几张，别把轮询占太久。 */
     const THUMB_PER_ROUND = 12;
     /** MIU 拉取支持哪几类（和 MIU 界面上的分类一致）。 */
-    const PULL_KINDS = ['character', 'worldbook', 'preset', 'theme', 'qr', 'regex'];
+    const PULL_KINDS = ['character', 'worldbook', 'preset', 'theme', 'qr', 'regex', 'persona'];
     const PULL_KIND_LABEL = {
         character: '角色卡',
         worldbook: '世界书',
@@ -37,6 +37,7 @@
         theme: '美化',
         qr: '快速回复',
         regex: '正则',
+        persona: '人设',
     };
     const TOOL_NAMES = [
         'miu_ping', 'miu_status', 'miu_push_begin',
@@ -625,6 +626,34 @@
             add('regex:' + index + ':' + name, 'regex', name, script, '', '');
         });
 
+        // 酒馆的 User 人设：power_user.personas 存名字，persona_descriptions 存设定。
+        const powerUser = asObject(source.power_user) || {};
+        const personasMap = asObject(powerUser.personas) || {};
+        const personaDescMap = asObject(powerUser.persona_descriptions) || {};
+        const activePersonaKey = String(source.user_avatar || '').trim();
+        const personaKeys = new Set(Object.keys(personasMap).concat(Object.keys(personaDescMap)));
+        if (personaKeys.size === 0 && activePersonaKey) personaKeys.add(activePersonaKey);
+        Array.from(personaKeys).forEach((avatarKey) => {
+            const rawDesc = personaDescMap[avatarKey];
+            const descObject = asObject(rawDesc);
+            const descText = typeof rawDesc === 'string'
+                ? rawDesc
+                : (descObject && typeof descObject.description === 'string' ? descObject.description : '');
+            const rawName = personasMap[avatarKey] || (activePersonaKey === avatarKey ? (source.name || source.user_name || '') : '');
+            const name = String(rawName || String(avatarKey).replace(/\.[^.]+$/, '') || '未命名 User').trim().slice(0, 160);
+            const isActive = activePersonaKey === avatarKey;
+            const payload = {
+                format: 'miu-persona-v1',
+                kind: 'persona',
+                avatarKey: avatarKey,
+                name: name,
+                description: descText,
+                content: descText,
+                active: isActive,
+            };
+            add('persona:' + avatarKey, 'persona', name, payload, '', isActive ? '当前人设' : 'User 人设');
+        });
+
         return { entries: entries, dataMap: dataMap };
     }
 
@@ -718,6 +747,27 @@
         }
         if (!tool || tool.payload === undefined) throw new Error('unknown_card');
         return tool.payload;
+    }
+
+    /** 人设头像：酒馆同源取原图，转成 data URL 塞进人设 JSON。 */
+    async function personaAvatarDataUrl(avatarKey) {
+        const key = String(avatarKey || '').trim();
+        if (!key) return '';
+        const urls = [
+            '/User Avatars/' + encodeURIComponent(key),
+            '/user/avatars/' + encodeURIComponent(key),
+        ];
+        for (const url of urls) {
+            try {
+                const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+                if (!response.ok) continue;
+                const blob = await response.blob();
+                if (!blob || blob.size === 0 || blob.size > 4 * 1024 * 1024) continue;
+                const bytes = new Uint8Array(await blob.arrayBuffer());
+                return 'data:' + (blob.type || 'image/png') + ';base64,' + bytesToBase64(bytes);
+            } catch (error) { /* 换下一个地址 */ }
+        }
+        return '';
     }
 
     async function pushBytes(name, bytes, thumb) {
@@ -1447,6 +1497,7 @@
         if (prefix === 'theme') return 'theme';
         if (prefix === 'qr') return 'qr';
         if (prefix === 'regex') return 'regex';
+        if (prefix === 'persona') return 'persona';
         return 'character';
     }
 
@@ -1483,7 +1534,16 @@
                     name = toolFileName(plainName, kind);
                     const payload = await resolveToolPayload(id, info);
                     if (!payload) throw new Error('unknown_card');
-                    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+                    let finalPayload = payload;
+                    if (kind === 'persona') {
+                        const avatarKey = (payload && payload.avatarKey)
+                            || (String(id).indexOf('persona:') === 0 ? String(id).slice('persona:'.length) : '');
+                        if (avatarKey) {
+                            const avatarDataUrl = await personaAvatarDataUrl(avatarKey);
+                            if (avatarDataUrl) finalPayload = Object.assign({}, payload, { avatarDataUrl: avatarDataUrl });
+                        }
+                    }
+                    const bytes = new TextEncoder().encode(JSON.stringify(finalPayload));
                     if (bytes.length > MAX_CARD_BYTES) throw new Error('size_limit');
                     result = await pushBytes(name, bytes, '');
                 }
