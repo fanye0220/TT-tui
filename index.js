@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '11-17 人设头像';
+    const BUILD_TAG = '11-18 人设修复';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -65,7 +65,8 @@
         qr_import_failed: '酒馆拒绝了这个快速回复集合。',
         regex_import_failed: '写不进正则：这里不是酒馆页面内部。',
         unsupported_script: '这份「脚本」不是酒馆正则（酒馆助手那种 JS 脚本没有导入接口），没推过去，还留在 MIU 队列里。',
-        unknown_json: '认不出这份 JSON 是哪一类数据（角色卡 / 世界书 / 预设 / 美化 / 快速回复 / 正则），没敢直接导，还留在 MIU 队列里。',
+        unknown_json: '认不出这份 JSON 是哪一类数据（角色卡 / 世界书 / 预设 / 美化 / 快速回复 / 正则 / 人设），没敢直接导，还留在 MIU 队列里。',
+        persona_import_failed: '写不进人设：酒馆的设置文件没读到，或者头像上传被拒绝。',
     };
 
     const state = {
@@ -630,8 +631,9 @@
 
         // 酒馆的 User 人设：power_user.personas 存名字，persona_descriptions 存设定。
         const powerUser = asObject(source.power_user) || {};
-        const personasMap = asObject(powerUser.personas) || {};
-        const personaDescMap = asObject(powerUser.persona_descriptions) || {};
+        // 有的 TT 版本把人设留在顶层（或者 power_user 是字符串），两边都认一下。
+        const personasMap = asObject(powerUser.personas) || asObject(source.personas) || {};
+        const personaDescMap = asObject(powerUser.persona_descriptions) || asObject(source.persona_descriptions) || {};
         const activePersonaKey = String(source.user_avatar || '').trim();
         const personaKeys = new Set(Object.keys(personasMap).concat(Object.keys(personaDescMap)));
         if (personaKeys.size === 0 && activePersonaKey) personaKeys.add(activePersonaKey);
@@ -740,19 +742,41 @@
         if (stillMissing.length > 0) throw new Error('unknown_card');
     }
 
-    /** 取一项工具的正文；世界书按名字现取，其它用已加载的正文。 */
+    /** 取一项工具的正文；世界书按名字现取，其它用已加载的正文，缺了就地补取一次。 */
     async function resolveToolPayload(id, info) {
-        const tool = state.toolData.get(id);
+        let tool = state.toolData.get(id);
         const name = (tool && tool.name) || (info && info.name) || toolNameFromId(id);
         const kind = (tool && tool.kind) || (info && info.kind) || kindFromId(id);
         if (kind === 'worldbook') {
             return await postTavernJson('/api/worldinfo/get', { name: name });
+        }
+        if (!tool || tool.payload === undefined) {
+            // 列表阶段本来就不留正文；这里单张现取，一张取不到不影响同批的其它项。
+            try {
+                await loadToolPayloads([id]);
+            } catch (error) {
+                log('现取「' + name + '」的正文失败：' + describe(error));
+            }
+            tool = state.toolData.get(id);
         }
         if (!tool || tool.payload === undefined) throw new Error('unknown_card');
         return tool.payload;
     }
 
     /** 人设头像：酒馆同源取原图，转成 data URL 塞进人设 JSON。 */
+    async function fetchWithTimeout(url, timeoutMs) {
+        if (typeof AbortController !== 'function') {
+            return fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+        try {
+            return await fetch(url, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     async function personaAvatarDataUrl(avatarKey) {
         const key = String(avatarKey || '').trim();
         if (!key) return '';
@@ -765,10 +789,12 @@
         ];
         for (const url of urls) {
             try {
-                const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+                // 地址不对时酒馆可能一直不返回，卡住就换下一个，别让人设正文跟着一起等。
+                const response = await fetchWithTimeout(url, 2500);
                 if (!response.ok) continue;
                 const blob = await response.blob();
                 if (!blob || blob.size === 0 || blob.size > 4 * 1024 * 1024) continue;
+                if (blob.type && blob.type.indexOf('image/') !== 0) continue;
                 const bytes = new Uint8Array(await blob.arrayBuffer());
                 return 'data:' + (blob.type || 'image/png') + ';base64,' + bytesToBase64(bytes);
             } catch (error) { /* 换下一个地址 */ }
@@ -1177,8 +1203,29 @@
     /** 队列里的字节属于哪一类数据；认不出来就返回 null（当角色卡处理）。 */
     /** 文件名里的类型提示：App 推工具数据时会写成 xxx.preset.json 这种，不用再靠猜。 */
     function hintFromFileName(fileName) {
-        const match = /\.(worldbook|preset|theme|qr|regex|script)\.json$/i.exec(String(fileName || ''));
+        const match = /\.(worldbook|preset|theme|qr|regex|script|persona)\.json$/i.exec(String(fileName || ''));
         return match ? match[1].toLowerCase() : null;
+    }
+
+    /** MIU 的人设 JSON：format=miu-persona-v1 / kind=persona，带可选的头像 data URL。 */
+    function personaPayloadFrom(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const marked = value.format === 'miu-persona-v1' || value.kind === 'persona' || value.type === 'persona';
+        if (!marked) return null;
+        const content = String(
+            value.content !== undefined ? value.content
+                : (value.description !== undefined ? value.description
+                    : (value.user_description !== undefined ? value.user_description : '')),
+        );
+        const avatarDataUrl = typeof value.avatarDataUrl === 'string'
+            ? value.avatarDataUrl
+            : (typeof value.avatar === 'string' && value.avatar.indexOf('data:') === 0 ? value.avatar : '');
+        return {
+            name: String(value.name || value.user_name || '').trim(),
+            content: content,
+            avatarDataUrl: avatarDataUrl,
+            isDefault: Boolean(value.isDefault),
+        };
     }
 
     /** 队列里的字节属于哪一类数据：文件名带类型就按它来，不带再按内容猜；实在认不出就报 unknown。 */
@@ -1195,6 +1242,13 @@
             return null;
         }
         if (!parsed || typeof parsed !== 'object') return null;
+
+        if (hint === 'persona') {
+            const persona = personaPayloadFrom(parsed);
+            if (persona) return { kind: 'persona', label: '人设', payload: persona };
+        }
+        const persona = personaPayloadFrom(parsed);
+        if (persona) return { kind: 'persona', label: '人设', payload: persona };
 
         if (hint === 'preset') {
             const picked = pickPresetPayload(parsed);
@@ -1319,7 +1373,7 @@
     function stripExtension(name) {
         const value = String(name || '').trim();
         const stripped = value
-            .replace(/\.(worldbook|preset|theme|qr|regex|script)\.json$/i, '')
+            .replace(/\.(worldbook|preset|theme|qr|regex|script|persona)\.json$/i, '')
             .replace(/\.[^./\\]+$/, '');
         return stripped || value || 'miu_tool';
     }
@@ -1382,6 +1436,154 @@
         await saveSettings();
         return true;
     }
+
+    /** 酒馆设置接口有的版本返回 {settings:"<json>"}，有的直接返回设置对象，两种都认。 */
+    function settingsFileFromResponse(data) {
+        if (data && typeof data.settings === 'string') {
+            try { return JSON.parse(data.settings); } catch (error) { return null; }
+        }
+        const nested = asObject(data && data.settings);
+        if (nested) return nested;
+        const flat = asObject(data);
+        if (flat && (flat.power_user || flat.user_avatar !== undefined || flat.name !== undefined)) return flat;
+        return null;
+    }
+
+    /** 人设头像统一转 PNG：酒馆的人设图按 png 存最稳。转不动就原样上传。 */
+    function blobToPng(blob) {
+        return new Promise(function (resolve) {
+            if (!blob || !blob.size) return resolve(null);
+            if (blob.type === 'image/png') return resolve(blob);
+            let blobUrl = '';
+            try {
+                blobUrl = URL.createObjectURL(blob);
+                const image = new Image();
+                let settled = false;
+                const done = function (value) {
+                    if (settled) return;
+                    settled = true;
+                    if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (error) {}
+                    resolve(value);
+                };
+                const timer = setTimeout(function () { done(blob); }, 4000);
+                image.onload = function () {
+                    if (settled) return;
+                    try {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = image.naturalWidth || image.width;
+                        canvas.height = image.naturalHeight || image.height;
+                        const context = canvas.getContext('2d');
+                        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                        canvas.toBlob(function (png) {
+                            clearTimeout(timer);
+                            done(png || blob);
+                        }, 'image/png');
+                    } catch (error) {
+                        clearTimeout(timer);
+                        done(blob);
+                    }
+                };
+                image.onerror = function () {
+                    clearTimeout(timer);
+                    done(blob);
+                };
+                image.src = blobUrl;
+            } catch (error) {
+                if (blobUrl) try { URL.revokeObjectURL(blobUrl); } catch (ignore) {}
+                resolve(blob);
+            }
+        });
+    }
+
+    function dataUrlToBlob(dataUrl) {
+        const text = String(dataUrl || '');
+        if (text.indexOf('data:') !== 0) return null;
+        const comma = text.indexOf(',');
+        if (comma < 0) return null;
+        const mime = (text.slice(5, comma).split(';')[0] || 'image/png');
+        if (mime.indexOf('image/') !== 0) return null;
+        try {
+            const bytes = base64ToBytes(text.slice(comma + 1));
+            if (!bytes || bytes.length === 0) return null;
+            return new Blob([bytes], { type: mime });
+        } catch (error) {
+            return null;
+        }
+    }
+
+    /**
+     * 人设：酒馆没有单独的人设导入接口，只能先传头像，再把 power_user.personas /
+     * persona_descriptions 写进设置文件存回去（和 MIU 里「发送到酒馆（酒馆 API）」一个路子）。
+     */
+    async function importPersonaToTavern(fileName, persona) {
+        const name = String((persona && persona.name) || stripExtension(fileName) || 'User').trim() || 'User';
+        const content = String((persona && persona.content) || '');
+
+        let data = null;
+        try {
+            data = await postTavernJson('/api/settings/get', {});
+        } catch (error) {
+            throw new Error('persona_import_failed');
+        }
+        const settingsFile = settingsFileFromResponse(data);
+        if (!settingsFile) throw new Error('persona_import_failed');
+
+        if (!asObject(settingsFile.power_user)) settingsFile.power_user = {};
+        const powerUser = settingsFile.power_user;
+        if (!asObject(powerUser.personas)) powerUser.personas = {};
+        if (!asObject(powerUser.persona_descriptions)) powerUser.persona_descriptions = {};
+
+        const slug = name.replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 20) || 'miu';
+        const taken = new Set(Object.keys(powerUser.personas));
+        let key = 'miu_' + slug + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.png';
+        while (taken.has(key)) {
+            key = 'miu_' + slug + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.png';
+        }
+
+        const blob = persona && persona.avatarDataUrl ? await blobToPng(dataUrlToBlob(persona.avatarDataUrl)) : null;
+        if (blob) {
+            const headers = await requestHeaders();
+            delete headers['Content-Type'];
+            delete headers['content-type'];
+            const upload = function (endpoint) {
+                const form = new FormData();
+                form.append('avatar', blob, key);
+                form.append('overwrite_name', key);
+                return fetch(endpoint, { method: 'POST', headers: headers, body: form, cache: 'no-store' });
+            };
+            let response = await upload('/api/avatars/upload');
+            if (response.status === 404) response = await upload('/uploaduseravatar');
+            if (!response.ok) {
+                // 头像没传上去也别把整条人设丢掉：名字和设定才是关键，头像个占位图而已。
+                log('人设头像上传失败（HTTP ' + response.status + '），「' + name + '」先只存名字和设定。');
+            } else {
+                const uploaded = await response.json().catch(function () { return {}; });
+                const returned = uploaded && typeof uploaded.path === 'string' ? uploaded.path.trim() : '';
+                if (returned) key = returned.split('/').pop() || key;
+            }
+        }
+
+        powerUser.personas[key] = name;
+        powerUser.persona_descriptions[key] = {
+            description: content,
+            position: 0,
+            depth: 2,
+            role: 0,
+            lore: '',
+            title: '',
+        };
+        if (persona && persona.isDefault) {
+            settingsFile.user_avatar = key;
+            settingsFile.name = name;
+            settingsFile.user_name = name;
+            settingsFile.user_description = content;
+        }
+
+        await postJsonToTavern('/api/settings/save', settingsFile, 'persona_import_failed');
+        state.toolDataAt = 0;
+        return true;
+    }
+
     /** 分片取回 MIU 里的一张待发送卡。 */
     async function fetchOutboxCard(meta, label) {
         const total = Math.max(1, Math.ceil(Number(meta.bytes) / CHUNK_BYTES));
@@ -1442,6 +1644,7 @@
                 else if (kind && kind.kind === 'theme') await importThemeToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'qr') await importQuickReplyToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'regex') await importRegexToTavern(fileName, kind.payload);
+                else if (kind && kind.kind === 'persona') await importPersonaToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'unsupported') throw new Error('unsupported_script');
                 else if (kind && kind.kind === 'unknown') throw new Error('unknown_json');
                 else await importCardToTavern(fileName, bytes);
@@ -1501,6 +1704,14 @@
             }
             const merged = list.concat(tools);
             rememberCatalog(merged);
+            // 人设一条都没读到：直接把原因送回 MIU，别让它显示一个空白列表让人以为卡住了。
+            if (want === 'persona' && merged.length === 0) {
+                const reason = '酒馆里没读到 User 人设。确认酒馆里确实有人设之后还是这样，多半是 TT 里的「MIU 联动」扩展还是旧版（旧版没有「人设」这一类），把它更新到 ' + BUILD_TAG + ' 或更新版本再试。';
+                log(reason);
+                setStatus(reason, 'error');
+                try { await callTool('miu_pull_error', { message: reason }); } catch (ignore) { /* 报不上去也只是少条提示 */ }
+                return;
+            }
             await callTool('miu_pull_list', { json: JSON.stringify(merged) });
             const label = PULL_KIND_LABEL[want] || '';
             setStatus('已把酒馆里的 ' + merged.length + ' 项' + (label ? '（' + label + '）' : '') + '发给 MIU，去 MIU 里勾选。', 'ok');
@@ -1527,6 +1738,7 @@
     async function pullForMiu(picks) {
         const named = new Map((state.catalog || []).map(item => [item.id, item]));
         const ids = [];
+        const failures = [];
         let done = 0;
         let failed = 0;
 
@@ -1574,7 +1786,9 @@
                 log('已拉到 MIU：' + name);
             } catch (error) {
                 failed++;
-                log('拉取失败：' + (name || id) + '（' + describe(error) + '）');
+                const reason = describe(error);
+                if (failures.length < 3) failures.push((name || id) + '（' + reason + '）');
+                log('拉取失败：' + (name || id) + '（' + reason + '）');
             }
 
             setStatus('正在给 MIU 拉取… ' + (index + 1) + ' / ' + picks.length);
@@ -1592,7 +1806,7 @@
                 final: true,
                 ids: ids,
                 message: failed > 0
-                    ? ('拉了 ' + done + ' 项，失败 ' + failed + ' 项。')
+                    ? ('拉了 ' + done + ' 项，失败 ' + failed + ' 项：' + failures.join('；'))
                     : ('已把 ' + done + ' 项拉到 MIU。'),
             });
         } catch (error) {
