@@ -17,7 +17,7 @@
     const CHUNK_BYTES = 48 * 1024;
     const MAX_CARD_BYTES = 32 * 1024 * 1024;
     /** 这一版的小标记：TT 面板上直接能看到，用来确认它跑的是不是新文件（版号没动，只能靠这个认）。 */
-    const BUILD_TAG = '11-18 人设修复';
+    const BUILD_TAG = '11-18 人设修复 v1.4.5';
     /** 小头像：最长边、JPEG 质量、单张 base64 上限、加载超时。 */
     const THUMB_MAX_SIDE = 112;
     const THUMB_QUALITY = 0.72;
@@ -1210,21 +1210,24 @@
     /** MIU 的人设 JSON：format=miu-persona-v1 / kind=persona，带可选的头像 data URL。 */
     function personaPayloadFrom(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-        const marked = value.format === 'miu-persona-v1' || value.kind === 'persona' || value.type === 'persona';
+        const inner = (value.persona && typeof value.persona === 'object' && !Array.isArray(value.persona))
+            ? value.persona
+            : ((value.data && typeof value.data === 'object' && !Array.isArray(value.data) && (value.data.format === 'miu-persona-v1' || value.data.kind === 'persona')) ? value.data : value);
+        const marked = inner.format === 'miu-persona-v1' || inner.kind === 'persona' || inner.type === 'persona';
         if (!marked) return null;
         const content = String(
-            value.content !== undefined ? value.content
-                : (value.description !== undefined ? value.description
-                    : (value.user_description !== undefined ? value.user_description : '')),
+            inner.content !== undefined ? inner.content
+                : (inner.description !== undefined ? inner.description
+                    : (inner.user_description !== undefined ? inner.user_description : '')),
         );
-        const avatarDataUrl = typeof value.avatarDataUrl === 'string'
-            ? value.avatarDataUrl
-            : (typeof value.avatar === 'string' && value.avatar.indexOf('data:') === 0 ? value.avatar : '');
+        const avatarDataUrl = typeof inner.avatarDataUrl === 'string'
+            ? inner.avatarDataUrl
+            : (typeof inner.avatar === 'string' && inner.avatar.indexOf('data:') === 0 ? inner.avatar : '');
         return {
-            name: String(value.name || value.user_name || '').trim(),
+            name: String(inner.name || inner.user_name || '').trim(),
             content: content,
             avatarDataUrl: avatarDataUrl,
-            isDefault: Boolean(value.isDefault),
+            isDefault: Boolean(inner.isDefault),
         };
     }
 
@@ -1246,6 +1249,27 @@
         if (hint === 'persona') {
             const persona = personaPayloadFrom(parsed);
             if (persona) return { kind: 'persona', label: '人设', payload: persona };
+            const src = (parsed.persona && typeof parsed.persona === 'object' && !Array.isArray(parsed.persona))
+                ? parsed.persona
+                : ((parsed.data && typeof parsed.data === 'object' && !Array.isArray(parsed.data)) ? parsed.data : parsed);
+            const content = String(
+                src.content !== undefined ? src.content
+                    : (src.description !== undefined ? src.description
+                        : (src.user_description !== undefined ? src.user_description : '')),
+            );
+            const avatarDataUrl = typeof src.avatarDataUrl === 'string'
+                ? src.avatarDataUrl
+                : (typeof src.avatar === 'string' && src.avatar.indexOf('data:') === 0 ? src.avatar : '');
+            return {
+                kind: 'persona',
+                label: '人设',
+                payload: {
+                    name: String(src.name || src.user_name || '').trim(),
+                    content: content,
+                    avatarDataUrl: avatarDataUrl,
+                    isDefault: Boolean(src.isDefault),
+                },
+            };
         }
         const persona = personaPayloadFrom(parsed);
         if (persona) return { kind: 'persona', label: '人设', payload: persona };
@@ -1511,6 +1535,33 @@
         }
     }
 
+    /** 没有随卡头像时画一张首字母 PNG，保证酒馆 User Avatars 目录里有对应文件。 */
+    function fallbackPersonaPng(name) {
+        return new Promise(function (resolve) {
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = 256;
+                canvas.height = 256;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return resolve(null);
+                const grad = ctx.createLinearGradient(0, 0, 256, 256);
+                grad.addColorStop(0, '#3b82f6');
+                grad.addColorStop(1, '#6366f1');
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, 0, 256, 256);
+                const ch = Array.from(String(name || 'U').trim())[0] || 'U';
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 116px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(ch, 128, 134);
+                canvas.toBlob(function (png) { resolve(png || null); }, 'image/png');
+            } catch (error) {
+                resolve(null);
+            }
+        });
+    }
+
     /**
      * 人设：酒馆没有单独的人设导入接口，只能先传头像，再把 power_user.personas /
      * persona_descriptions 写进设置文件存回去（和 MIU 里「发送到酒馆（酒馆 API）」一个路子）。
@@ -1540,7 +1591,8 @@
             key = 'miu_' + slug + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.png';
         }
 
-        const blob = persona && persona.avatarDataUrl ? await blobToPng(dataUrlToBlob(persona.avatarDataUrl)) : null;
+        let blob = persona && persona.avatarDataUrl ? await blobToPng(dataUrlToBlob(persona.avatarDataUrl)) : null;
+        if (!blob) blob = await fallbackPersonaPng(name);
         if (blob) {
             const headers = await requestHeaders();
             delete headers['Content-Type'];
@@ -1577,9 +1629,15 @@
             settingsFile.name = name;
             settingsFile.user_name = name;
             settingsFile.user_description = content;
+            powerUser.persona_description = content;
         }
 
-        await postJsonToTavern('/api/settings/save', settingsFile, 'persona_import_failed');
+        try {
+            await postJsonToTavern('/api/settings/save', settingsFile, 'persona_import_failed');
+        } catch (error) {
+            log('保存人设到酒馆设置失败，请检查酒馆是否允许写入设置。');
+            throw error;
+        }
         state.toolDataAt = 0;
         return true;
     }
@@ -1639,6 +1697,7 @@
                 const bytes = await fetchOutboxCard(meta, '「' + fileName + '」');
                 const hint = /\.json$/i.test(fileName) ? hintFromFileName(fileName) : null;
                 const kind = /\.json$/i.test(fileName) ? sniffJsonPayload(bytes, hint) : null;
+                if (hint === 'persona' && !kind) throw new Error('persona_import_failed');
                 if (kind && kind.kind === 'worldbook') await importWorldbookToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'preset') await importPresetToTavern(fileName, kind.payload);
                 else if (kind && kind.kind === 'theme') await importThemeToTavern(fileName, kind.payload);

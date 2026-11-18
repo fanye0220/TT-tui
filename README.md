@@ -60,6 +60,12 @@ MIU 收齐后自动进导入流程。
   直接显示一句原因就是扩展列卡失败，按那句话排查。
   酒馆切回前台会立刻补做一次，不用一直等。
 
+## 1.4.5 改了什么
+
+- 补全 **MIU -> 酒馆 接收人设**：识别 `.persona.json` 及 `format: "miu-persona-v1"` / `kind: "persona"` 数据，
+  不再被当成未知 JSON 报错；导入时写入酒馆 `power_user.personas` / `persona_descriptions`，
+  带头像时自动转 PNG 上传到酒馆 User Avatars，无头像时自动生成首字母头像；若为默认人设还会同步更新默认人设描述。
+
 ## 1.4.4 改了什么
 
 - 人设头像修好了：人设条目的 id 是 `persona:文件名`，之前整串拿去酒馆找图，
